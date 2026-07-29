@@ -1,0 +1,13 @@
+[project]
+name = "capital-api-sdk-rebuilt"
+version = "0.1.0"
+description = "High-level Python wrapper for Capital Securities / Futures SKCOM.dll"
+requires-python = ">=3.10"
+dependencies = [
+    "comtypes>=1.4.0; platform_system == 'Windows'",
+    "pywin32>=306; platform_system == 'Windows'",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["capital_api_sdk*"]
