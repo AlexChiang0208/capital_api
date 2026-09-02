@@ -18,10 +18,12 @@ from typing import Any, Callable, Iterable
 
 from .models import FutureRightsCoinType
 
-# OnNewData 委託回報的市場別(field[1])best-effort 分類:證券 vs 期貨。
-# 欄位代碼會隨 SKCOM.dll 版本略有差異;分類不到的仍保留在 open_orders 總表。
-STOCK_MARKET_TYPES = {"TS", "OS"}   # 證券 / 複委託證券
-FUTURE_MARKET_TYPES = {"TF", "OF"}  # 期貨 / 複委託期貨
+# OnNewData 委託回報的市場別(field[1])分類:證券 vs 期貨(官方 4-3-g 定義)。
+# TS 證券 / TA 盤後 / TL 零股 / TP 興櫃 / TC 盤中零股 / OS 複委託
+# TF 期貨 / TO 選擇權 / OF 海期 / OO 海選
+# 分類不到的代碼仍保留在 open_orders 總表。
+STOCK_MARKET_TYPES = {"TS", "TA", "TL", "TP", "TC", "OS"}
+FUTURE_MARKET_TYPES = {"TF", "TO", "OF", "OO"}
 
 # fetch_account_snapshot 的所有區塊(section)名稱。
 SNAPSHOT_SECTIONS = (
@@ -179,9 +181,10 @@ def fetch_future_rights(client, *, account: str | None = None,
 def fetch_open_orders(client, *, market: str = "all", reply_pump_sec: float = 3) -> dict:
     """當前掛單(dict of dict)。market: 'all' / 'stock'(現貨)/ 'future'(期貨)。
 
-    掛單來自 OnNewData 回報 cache(需 connect_reply=True 並 pump 收回報);
-    不論 market 為何都要等回報,拆 market 只是過濾輸出。
-    若要不依賴連線時間的完整掛單,改用 fetch_order_reports(n_format=3 可消單)。
+    掛單來自 OnNewData 回報 cache(需 connect_reply=True 並 pump 收回報),
+    已依成交(D)/取消(C)回報沖銷;不論 market 為何都要等回報,拆 market 只是過濾輸出。
+    若要不依賴連線時間的完整掛單,改用 fetch_order_reports(n_format=3 可消單,
+    盤中零股也查得到)。
     """
     client.pump(reply_pump_sec)
     orders = client.get_open_orders()
@@ -201,31 +204,62 @@ def _report_accounts(client, account: str | None) -> list[str | None]:
     return trading or [None]
 
 
+def _query_order_to_row(r) -> dict:
+    """QueryOrderReport -> 乾淨的 dict(官方 5-4-4 查詢格式)。"""
+    return {
+        "market": r.market, "product": r.product, "exchange": r.exchange,
+        "symbol": r.symbol, "buy_sell": r.buy_sell,
+        "status": r.status, "status_name": r.status_name, "session": r.session,
+        "stock_flag": r.stock_flag, "trade_type": r.trade_type, "price_type": r.price_type,
+        "price": r.price, "orig_qty": r.orig_qty, "filled_qty": r.filled_qty,
+        "remaining_qty": r.remaining_qty, "avg_fill_price": r.avg_fill_price,
+        "order_no": r.order_no, "seq_no": r.seq_no,
+        "order_date": r.order_date, "order_time": r.order_time, "raw": r.raw,
+    }
+
+
+def _query_fill_to_row(r) -> dict:
+    """QueryFillReport -> 乾淨的 dict(官方 5-4-5 查詢格式,含預估費稅)。"""
+    return {
+        "market": r.market, "product": r.product, "exchange": r.exchange,
+        "symbol": r.symbol, "buy_sell": r.buy_sell, "session": r.session,
+        "stock_flag": r.stock_flag, "price": r.price, "qty": r.qty,
+        "amount": r.amount, "fee": r.fee, "tax": r.tax,
+        "order_no": r.order_no, "fill_seq": r.fill_seq,
+        "fill_date": r.fill_date, "fill_time": r.fill_time, "raw": r.raw,
+    }
+
+
 def fetch_order_reports(client, *, account: str | None = None, n_format: int = 3) -> dict:
-    """當日委託回報查詢(同步 GetOrderReport,dict of dict)。
+    """當日委託回報查詢(同步 GetOrderReport,dict of dict,官方 5-4-4 查詢格式)。
 
     account=None 會依序查所有 TS/TF 交易帳號並合併(每個帳號間隔 5 秒,
-    SDK 自動以 pump 等待)。
+    SDK 自動以 pump 等待)。key 為委託書號,value 含 status_name(全部成交/
+    委託成功/部分成交...)、filled_qty、remaining_qty 等。
     n_format: 1 全部 / 2 有效 / 3 可消 / 4 已消 / 5 已成 / 6 失敗 /
               7 合併同價格 / 8 合併同商品 / 9 預約。預設 3(可取消的掛單)。
+    盤中零股(盤別 F)也查得到,實測與官方欄位表逐欄核對。
     """
-    events = []
+    rows = []
     for acc in _report_accounts(client, account):
-        events.extend(client.get_order_report(account=acc, n_format=n_format))
-    return _order_table(events)
+        rows.extend(client.get_order_report(account=acc, n_format=n_format))
+    return _rows_to_dict([_query_order_to_row(r) for r in rows],
+                         lambda r: r.get("order_no") or r.get("seq_no"))
 
 
 def fetch_fulfill_reports(client, *, account: str | None = None, n_format: int = 1) -> dict:
-    """當日成交回報查詢(同步 GetFulfillReport,dict of dict)。
+    """當日成交回報查詢(同步 GetFulfillReport,dict of dict,官方 5-4-5 查詢格式)。
 
     account=None 會依序查所有 TS/TF 交易帳號並合併(每個帳號間隔 5 秒,
-    SDK 自動以 pump 等待)。
+    SDK 自動以 pump 等待)。value 含成交價/量/價金與預估手續費、交易稅。
     n_format: 1 完整 / 2 合併同書號 / 3 合併同價格 / 4 合併同商品 / 5 T+1成交。
+    盤中零股成交也查得到(盤別 F)。
     """
-    events = []
+    rows = []
     for acc in _report_accounts(client, account):
-        events.extend(client.get_fulfill_report(account=acc, n_format=n_format))
-    return _order_table(events)
+        rows.extend(client.get_fulfill_report(account=acc, n_format=n_format))
+    return _rows_to_dict([_query_fill_to_row(r) for r in rows],
+                         lambda r: r.get("fill_seq") or r.get("order_no"))
 
 
 def fetch_account_snapshot(
