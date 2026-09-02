@@ -218,6 +218,8 @@ _DATA_KIND_ALIASES = {
 QUOTE_PAGE_NO = 1
 # RequestStocks silently truncates to the first 100 symbols.
 MAX_QUOTE_SYMBOLS = 100
+# RequestTicks pages run 0-49 (page 50 = cancel sentinel), one symbol per page.
+MAX_TICK_SYMBOLS = 50
 
 
 def ensure_quote_session(
@@ -588,20 +590,36 @@ def _start_realtime_session(
             f"RequestStocks handles at most {MAX_QUOTE_SYMBOLS} symbols; extra symbols are ignored by SKCOM."
         )
 
+    _subscribe_realtime_session(client, session)
+    return session
+
+
+def _subscribe_realtime_session(client: CapitalClient, session: _RealtimeSession) -> None:
+    """(Re-)issue the session's quote + tick subscriptions.
+
+    Also used after a reconnect: a fresh quote session (new STOCKS_READY event)
+    has lost every previous subscription, so streams re-run this when
+    client.quote_ready_count() increases.
+    """
     # Quote subscription always runs: it feeds snapshot values and lets the hub
     # map tick/best5 events (keyed by market_no+index) back to symbols.
-    result = client.subscribe_quotes(symbol_list, page_no=QUOTE_PAGE_NO, market_no=session.market_no)
+    result = client.subscribe_quotes(session.symbols, page_no=QUOTE_PAGE_NO, market_no=session.market_no)
     if not result.ok:
         session.errors.append(_api_result_message(result))
 
     if "ticks" in session.kinds or "orderbook" in session.kinds:
-        for page_no, symbol in enumerate(symbol_list):
+        session.tick_symbols.clear()
+        if len(session.symbols) > MAX_TICK_SYMBOLS:
+            session.errors.append(
+                f"RequestTicks holds one symbol per page (pages 0-{MAX_TICK_SYMBOLS - 1}); "
+                f"only the first {MAX_TICK_SYMBOLS} symbols get tick/orderbook subscriptions."
+            )
+        for page_no, symbol in enumerate(session.symbols[:MAX_TICK_SYMBOLS]):
             result = client.subscribe_ticks(symbol, page_no=page_no, market_no=session.market_no)
             if result.ok:
                 session.tick_symbols.append(symbol)
             else:
                 session.errors.append(_api_result_message(result))
-    return session
 
 
 def _finish_realtime_session(client: CapitalClient, session: _RealtimeSession) -> None:
@@ -752,17 +770,12 @@ def fetch_latest_quotes(
 def _drain_quote_events(client: CapitalClient, *, timeout_sec: float, idle_sec: float = 0.3) -> None:
     """Pump until no new tick/quote/best5 events arrive for idle_sec (or timeout)."""
     end_time = time.monotonic() + max(0.0, float(timeout_sec))
-    hub = client.hub
-
-    def counts() -> tuple[int, int, int]:
-        return len(hub.tick_events), len(hub.quote_events), len(hub.best5_events)
-
-    last = counts()
+    last = client.hub.quote_event_totals()
     last_change = time.monotonic()
     while time.monotonic() < end_time:
         client.pump(0.1)
         now = time.monotonic()
-        current = counts()
+        current = client.hub.quote_event_totals()
         if current != last:
             last, last_change = current, now
         elif now - last_change >= idle_sec:
@@ -843,10 +856,17 @@ def stream_realtime_quote_events(
     key_symbols: dict[tuple[int, int], str] = {}
     offsets = {"quote": 0, "tick": 0, "best5": 0}
     end_time = None if seconds is None else time.monotonic() + float(seconds)
+    ready_count = client.quote_ready_count()
 
     try:
         while end_time is None or time.monotonic() < end_time:
             client.pump(float(pump_interval_sec))
+            # A new STOCKS_READY event means the quote session reconnected and
+            # lost all subscriptions server-side; re-issue them.
+            current_ready = client.quote_ready_count()
+            if current_ready > ready_count:
+                ready_count = current_ready
+                _subscribe_realtime_session(client, session)
             yield from _new_stream_events(
                 client, session.kinds, offsets, accepted, key_symbols,
                 include_history=include_history,
@@ -865,9 +885,8 @@ def _new_stream_events(
     include_history: bool = True,
 ) -> Iterable[QuoteStreamEvent]:
     # Quote events always flow (they feed the key->symbol map); only yield the
-    # kinds the caller asked for.
-    quote_events = client.hub.quote_events[offsets["quote"]:]
-    offsets["quote"] += len(quote_events)
+    # kinds the caller asked for. Cursor APIs stay valid across cache trimming.
+    quote_events, offsets["quote"] = client.hub.get_quotes_since(offsets["quote"])
     for quote in quote_events:
         if quote.symbol not in accepted:
             continue
@@ -877,8 +896,7 @@ def _new_stream_events(
             yield QuoteStreamEvent(kind="quote", symbol=quote.symbol, data=quote)
 
     if "ticks" in kinds:
-        tick_events = client.hub.tick_events[offsets["tick"]:]
-        offsets["tick"] += len(tick_events)
+        tick_events, offsets["tick"] = client.hub.get_ticks_since(offsets["tick"])
         for tick in tick_events:
             if tick.history and not include_history:
                 continue
@@ -890,8 +908,7 @@ def _new_stream_events(
             yield QuoteStreamEvent(kind="tick", symbol=symbol, data=tick)
 
     if "orderbook" in kinds:
-        best5_events = client.hub.best5_events[offsets["best5"]:]
-        offsets["best5"] += len(best5_events)
+        best5_events, offsets["best5"] = client.hub.get_best5_since(offsets["best5"])
         for best5 in best5_events:
             symbol = _stream_symbol(best5.symbol, best5.market_no, best5.stock_index, accepted, key_symbols)
             if symbol is None:
