@@ -39,7 +39,18 @@ class RawReport:
 
 @dataclass(slots=True)
 class OrderEvent:
-    """Parsed from SKReplyLib.OnNewData raw comma-separated report."""
+    """Parsed from SKReplyLib.OnNewData raw comma-separated report (official 4-3-g).
+
+    Field notes (verified against the V2.13.58 manual and live reports):
+      market_type  TS 證券 / TA 盤後 / TL 零股 / TP 興櫃 / TC 盤中零股 /
+                   TF 期貨 / TO 選擇權 / OF 海期 / OO 海選 / OS 複委託
+      report_type  N 委託 / C 取消 / U 改量 / P 改價 / D 成交 / B 改價改量 / S 動態退單
+      order_error  N 正常 / Y 失敗 / T 逾時
+      side         composite BuySell field, e.g. "S00R2" = 賣 + 現股(00) + ROD + 限價(2);
+                   the first char is always B(買)/S(賣) -> use .buy_sell
+      before_qty / after_qty are EMPTY for C(取消) and D(成交) reports; a D report's
+      qty is the fill quantity of that (possibly partial) fill.
+    """
     login_id: str
     raw: str
     fields: list[str]
@@ -64,8 +75,23 @@ class OrderEvent:
     seq_no: str = ""
 
     @property
+    def buy_sell(self) -> str:
+        """'B' or 'S' (first char of the composite BuySell field), '' if unknown."""
+        first = self.side[:1].upper()
+        return first if first in ("B", "S") else ""
+
+    @property
     def is_fill(self) -> bool:
         return self.report_type == "D"
+
+    @property
+    def is_cancel(self) -> bool:
+        """True for 取消(C) and 交易所動態退單(S) reports."""
+        return self.report_type in ("C", "S")
+
+    @property
+    def is_failed(self) -> bool:
+        return self.order_error in ("Y", "T") or bool(self.error_msg)
 
     @property
     def remaining_qty(self) -> Optional[int]:
@@ -76,8 +102,126 @@ class OrderEvent:
 
     @property
     def is_open_like(self) -> bool:
+        """Best-effort per-event view: order-lifecycle report that leaves qty open.
+
+        NOTE: a single event cannot know about later fills; use
+        EventHub.get_open_orders() for the fill/cancel-aware aggregation.
+        """
+        if self.is_fill or self.is_cancel or self.is_failed:
+            return False
         rem = self.remaining_qty
-        return (not self.is_fill) and (rem is None or rem > 0) and not self.error_msg
+        return rem is None or rem > 0
+
+
+# GetOrderReport row status codes (official 5-4-4 field 11).
+ORDER_STATUS_NAMES = {
+    "0": "預約", "2": "全部成交", "3": "全部取消", "4": "部分成交,剩餘已取消",
+    "5": "部分成交,剩餘可取消", "6": "委託失敗", "7": "委託成功", "8": "取消失敗",
+    "9": "取消中", "F": "動態退單", "F1": "動態退單-全部取消",
+    "F2": "動態退單-部分成交,剩餘已取消", "F3": "動態退單-部分委託成功", "F4": "否決",
+}
+# Query-row 盤別 codes (official 5-4-4 field 24).
+QUERY_SESSION_NAMES = {
+    "A": "一般", "B": "盤後", "C": "零股", "D": "拍賣", "E": "鉅額",
+    "F": "盤中零股", "G": "標借", "H": "標購", "I": "證金標購",
+}
+
+
+@dataclass(slots=True)
+class QueryOrderReport:
+    """One GetOrderReport row (official 5-4-4, nFormat 1-6/9).
+
+    NOTE: this sync-query row format is COMPLETELY DIFFERENT from OnNewData.
+    Code meanings also differ from the order-sending enums:
+      status      see ORDER_STATUS_NAMES (0 預約 / 2 全部成交 / 5 部分成交可消 / 7 委託成功 ...)
+      session     盤別, see QUERY_SESSION_NAMES (A 一般 / B 盤後 / C 零股 / F 盤中零股 ...)
+      stock_flag  0 現股 / 1 代資 / 2 代券 / 3 融資 / 4 融券 / 5,6 借券賣出 / 8 無券賣出
+      trade_type  0 ROD / 1 GTC / 2 開盤(AT_THE_OPENING) / 3 IOC / 4 FOK / 7 收盤(AT_THE_CLOSE)
+      price_type  1 市價 / 2 限價 / 3 範圍市價(期)或停損(海期) / 4 停損限價 / 5 收市價
+    """
+    login_id: str = ""
+    market: str = ""           # TW/TS/TF/OS/OF
+    product: str = ""          # STO 股票 / FUT 期貨 / OPT 選擇權 / ASO
+    exchange: str = ""         # TSEA 上市 / TSEB 上櫃 / OTC 興櫃 / TAIFEX
+    branch: str = ""
+    account: str = ""
+    order_no: str = ""         # 委託書號
+    seq_no: str = ""           # 13碼電子流水號
+    orig_seq_no: str = ""
+    status: str = ""
+    order_date: str = ""
+    order_time: str = ""
+    symbol: str = ""
+    buy_sell: str = ""         # B/S
+    session: str = ""
+    stock_flag: str = ""
+    trade_type: str = ""
+    price_type: str = ""
+    price: str = ""
+    orig_price: str = ""
+    valid_qty: str = ""        # 有效委託數量
+    orig_qty: str = ""
+    filled_qty: str = ""
+    remaining_qty: str = ""
+    day_trade: str = ""        # Y 當沖 / N 新倉 / O 平倉 / A 自動
+    error_mark: str = ""       # Y 錯誤回報 / N 正常
+    agent: str = ""
+    unit_shares: str = ""      # 交易單位股數 (1000=整股)
+    reserved_price_mark: str = ""  # 證券預約單價格註記: 空白 委託價 / 0 平盤 / 1 漲停 / 2 跌停 / h,l,C,c
+    sale_no: str = ""
+    avg_fill_price: str = ""
+    cancel_qty: str = ""
+    fill_date: str = ""
+    fill_time: str = ""
+    fields: list[str] = field(default_factory=list)
+    raw: str = ""
+
+    @property
+    def status_name(self) -> str:
+        return ORDER_STATUS_NAMES.get(self.status, self.status)
+
+    @property
+    def is_open(self) -> bool:
+        """Cancellable / working states: 5 部分成交剩餘可取消, 7 委託成功, 0 預約."""
+        return self.status in ("0", "5", "7")
+
+
+@dataclass(slots=True)
+class QueryFillReport:
+    """One GetFulfillReport row (official 5-4-5, nFormat 1/5).
+
+    fee 為預估手續費(證券千分之1.425), tax 為預估交易稅(千分之1或3);
+    session/stock_flag/trade_type 代碼同 QueryOrderReport。
+    """
+    login_id: str = ""
+    market: str = ""
+    product: str = ""
+    exchange: str = ""
+    branch: str = ""
+    account: str = ""
+    order_no: str = ""
+    fill_seq: str = ""         # 成交序號
+    fill_date: str = ""
+    fill_time: str = ""
+    symbol: str = ""
+    buy_sell: str = ""
+    session: str = ""
+    stock_flag: str = ""
+    trade_type: str = ""
+    price: str = ""            # 成交價
+    qty: str = ""              # 成交量
+    price_type: str = ""
+    agent: str = ""
+    sale_no: str = ""
+    fee: str = ""
+    tax: str = ""
+    order_date: str = ""
+    order_time: str = ""
+    unit_shares: str = ""
+    amount: str = ""           # 成交價金
+    fill_time_ms: str = ""     # hhmmssfff
+    fields: list[str] = field(default_factory=list)
+    raw: str = ""
 
 
 @dataclass(slots=True)
@@ -107,13 +251,15 @@ class StockPosition:
 
 @dataclass(slots=True)
 class FuturePosition:
+    """One GetOpenInterestGW (nFormat=1) row; see parsers.parse_future_position_raw."""
+    market_type: str = ""
     symbol: str = ""
     buy_sell: str = ""
     open_qty: str = ""
     day_trade_qty: str = ""
     avg_price: str = ""
-    market_price: str = ""
-    floating_pl: str = ""
+    fee: str = ""
+    tax: str = ""
     account_no: str = ""
     login_id: str = ""
     raw: str = ""
@@ -316,6 +462,20 @@ class PublicMarketInfo:
 
 
 # ----------------------------------------------------------------------
+# Order price special codes (official 5-4 STOCKORDER / 5-2 FUTUREORDER)
+# ----------------------------------------------------------------------
+# STOCKORDER.bstrPrice: numeric limit price, or one of these codes.
+# A MARKET order instead uses price="0" with StockPriceType.MARKET.
+STOCK_PRICE_REFERENCE = "M"    # 參考價(昨收/平盤價)
+STOCK_PRICE_LIMIT_UP = "H"     # 漲停價
+STOCK_PRICE_LIMIT_DOWN = "L"   # 跌停價
+# FUTUREORDER.bstrPrice: numeric limit price, or one of these codes.
+# Official rule: the codes are only valid with IOC or FOK (not ROD).
+FUTURES_PRICE_MARKET = "M"        # 市價
+FUTURES_PRICE_RANGE_MARKET = "P"  # 範圍市價(一定範圍市價單)
+
+
+# ----------------------------------------------------------------------
 # Enums
 # ----------------------------------------------------------------------
 class Authority(IntEnum):
@@ -381,6 +541,16 @@ class FutureRightsCoinType(IntEnum):
     ALL = 0
     TWD = 1
     RMB = 2
+
+
+class OrderMarket(IntEnum):
+    """nMarketType for SetMaxQty / SetMaxCount / UnlockOrder (official 4-2-4/4-2-5)."""
+    STOCK = 0            # TS 證券
+    FUTURES = 1          # TF 期貨
+    OPTIONS = 2          # TO 選擇權
+    FOREIGN_STOCK = 3    # OS 複委託
+    OVERSEA_FUTURES = 4  # OF 海外期貨
+    OVERSEA_OPTIONS = 5  # OO 海外選擇權
 
 
 class MarketType(StrEnum):
