@@ -11,6 +11,8 @@ from .models import (
     FutureRights,
     KLineRecord,
     OrderEvent,
+    QueryFillReport,
+    QueryOrderReport,
     QuoteBest5,
     QuoteSnapshot,
     QuoteTick,
@@ -57,6 +59,17 @@ def parse_capital_pay_balance(raw: str) -> CapitalPayBalance:
 
 
 def parse_order_event(login_id: str, raw: str) -> OrderEvent:
+    """
+    Parse one OnNewData report row (official manual 4-3-g, 48 fields, 0-based):
+    0 KeyNo, 1 MarketType, 2 Type, 3 OrderErr, 4 Broker, 5 CustNo,
+    6 BuySell(composite), 7 ExchangeID, 8 ComId(symbol), 9 StrikePrice,
+    10 OrderNo(委託書號), 11 Price, 12-19 Numerator/Denominator/Price1/Price2...,
+    20 Qty, 21 BeforeQty, 22 AfterQty, 23 Date, 24 Time, 25 OkSeq, 26 SubID,
+    27 SaleNo, 28 Agent, 29 TradeDate, 30 MsgNo, 31 PreOrder(A盤中/B預約),
+    32-37 leg1/leg2 ComId/YearMonth/StrikePrice, 38 ExecutionNo, 39 PriceSymbol,
+    40 Reserved(盤別), 41 OrderEffective, 42 CallPut, 43 OrderSeq(交易所單號),
+    44 ErrorMsg, 45 CancelOrderMarkByExchange, 46 ExchangeTandemMsg, 47 SeqNo(13碼).
+    """
     f = raw.split(',')
     return OrderEvent(
         login_id=login_id,
@@ -86,11 +99,15 @@ def parse_order_event(login_id: str, raw: str) -> OrderEvent:
 
 def parse_stock_position_raw(raw: str) -> StockPosition:
     """
-    Best-effort parser for OnRealBalanceReport.
-    Official SKDLLPythonTester RealBalanceReport struct maps these first fields:
-    StockCode, InventoryType, ..., YesterdayInventory, TodayBidQty, TodayAskQty,
-    TodayBuyMatched, TodaySellMatched, AvailableToSellOrCover, ..., RealTimeInventory,
-    ..., LoginID, AccountNo.
+    Parse one OnRealBalanceReport row (official manual 4-2-c, 0-based):
+    0 股票代號, 1 庫存種類(T集保/C融資/L融券), 2 資額度原始, 3 資額度可用,
+    4 券額度原始, 5 券額度可用, 6 昨日庫存, 7 今日委買, 8 今日委賣,
+    9 今日買進成交, 10 今日賣出成交, 11 資券可回補/集保可賣出, 12 可資沖股數,
+    13 可券沖股數, 14 即時庫存, 15 (忽略), 16 即時個股維持率,
+    17 LOGIN_ID, 18 ACCOUNT_NO.
+
+    today_buy_qty / today_sell_qty are today's ORDERED quantities (委買/委賣);
+    the matched quantities are today_buy_matched / today_sell_matched.
     """
     f = raw.split(',')
     return StockPosition(
@@ -103,25 +120,31 @@ def parse_stock_position_raw(raw: str) -> StockPosition:
         today_sell_matched=safe_get(f, 10),
         sellable_qty=safe_get(f, 11),
         realtime_inventory=safe_get(f, 14),
-        login_id=safe_get(f, 16),
-        account_no=safe_get(f, 17),
+        login_id=safe_get(f, 17),
+        account_no=safe_get(f, 18),
         raw=raw,
     )
 
 
 def parse_future_position_raw(raw: str) -> FuturePosition:
-    """Best-effort parser for OnOpenInterest. Field order can vary by nFormat/version; raw is preserved."""
+    """
+    Parse one OnOpenInterest row from GetOpenInterestGW nFormat=1 (official manual,
+    0-based): 0 市場別(TM), 1 帳號, 2 商品, 3 買賣別, 4 未平倉部位,
+    5 當沖未平倉部位, 6 平均成本(小數已處理), 7 單口手續費, 8 交易稅(萬分之X),
+    9 LOGIN_ID. GW format 1 does NOT carry market price / floating P&L.
+    """
     f = raw.split(',')
     return FuturePosition(
-        symbol=safe_get(f, 2) or safe_get(f, 0),
+        market_type=safe_get(f, 0),
+        account_no=safe_get(f, 1),
+        symbol=safe_get(f, 2),
         buy_sell=safe_get(f, 3),
         open_qty=safe_get(f, 4),
         day_trade_qty=safe_get(f, 5),
         avg_price=safe_get(f, 6),
-        market_price=safe_get(f, 7),
-        floating_pl=safe_get(f, 8),
-        login_id=safe_get(f, -2) if len(f) >= 2 else "",
-        account_no=safe_get(f, -1) if len(f) >= 1 else "",
+        fee=safe_get(f, 7),
+        tax=safe_get(f, 8),
+        login_id=safe_get(f, 9),
         raw=raw,
     )
 
@@ -153,21 +176,86 @@ def parse_many(lines: Iterable[str], parser):
     return [parser(line) for line in lines if str(line).strip()]
 
 
-def parse_report_query_result(login_id: str, raw: str) -> list[OrderEvent]:
+def parse_query_order_row(login_id: str, raw: str) -> QueryOrderReport:
+    """
+    Parse one GetOrderReport row (official 5-4-4, nFormat 1-6/9; 0-based = 官方編號-1):
+    0 市場別, 1 商品別, 2 交易所別, 3 分公司, 4 IBNO, 5 帳號, 6 子帳,
+    7 委託書號, 8 13碼流水號, 9 原始13碼, 10 委託狀態, 11 委託日, 12 委託時間,
+    13 歸屬日, 14 有效日, 15 商品代號, 16-21 兩腳Tandem, 22 買賣別, 23 盤別,
+    24 證券委託條件, 25 委託條件, 26 委託方式, 27 委託價, 28 原始委託價,
+    29 有效量, 30 原始量, 31 成交量, 32 剩餘量, 33 當沖, 34 判別T+1, 35 錯誤回報,
+    36 下單來源, 37 交易單位股數, 38 預約單價格註記, 39 營業員, 40 CallPut,
+    41-48 分子分母/觸發價, 49 交易所訊息, 50 退單基準價, 51 取消總量,
+    52 成交日, 53 成交時間, 54-66 複委託/碎股, 67 委託時間hhmmssfff, 68 交易註記.
+    Verified live 2026-09-01 (intraday odd-lot fills).
+    """
+    f = raw.split(',')
+    return QueryOrderReport(
+        login_id=login_id,
+        market=safe_get(f, 0), product=safe_get(f, 1), exchange=safe_get(f, 2),
+        branch=safe_get(f, 3), account=safe_get(f, 5),
+        order_no=safe_get(f, 7), seq_no=safe_get(f, 8), orig_seq_no=safe_get(f, 9),
+        status=safe_get(f, 10), order_date=safe_get(f, 11), order_time=safe_get(f, 12),
+        symbol=safe_get(f, 15), buy_sell=safe_get(f, 22), session=safe_get(f, 23),
+        stock_flag=safe_get(f, 24), trade_type=safe_get(f, 25), price_type=safe_get(f, 26),
+        price=safe_get(f, 27), orig_price=safe_get(f, 28),
+        valid_qty=safe_get(f, 29), orig_qty=safe_get(f, 30),
+        filled_qty=safe_get(f, 31), remaining_qty=safe_get(f, 32),
+        day_trade=safe_get(f, 33), error_mark=safe_get(f, 35), agent=safe_get(f, 36),
+        unit_shares=safe_get(f, 37), reserved_price_mark=safe_get(f, 38),
+        sale_no=safe_get(f, 39), avg_fill_price=safe_get(f, 43), cancel_qty=safe_get(f, 51),
+        fill_date=safe_get(f, 52), fill_time=safe_get(f, 53),
+        fields=f, raw=raw,
+    )
+
+
+def parse_query_fill_row(login_id: str, raw: str) -> QueryFillReport:
+    """
+    Parse one GetFulfillReport row (official 5-4-5, nFormat 1/5). The live rows
+    carry NO 商品名稱 column, so from 商品代號 on the 0-based index is 官方編號-2:
+    0 市場別, 1 商品別, 2 交易所別, 3 分公司, 4 IBNO, 5 帳號, 6 子帳,
+    7 委託書號, 8 成交序號, 9 成交日, 10 成交時間, 11 歸屬日, 12 商品代號,
+    13-20 兩腳Tandem+成交價1/2, 21 買賣別, 22 盤別, 23 證券委託條件, 24 委託條件,
+    25 成交價, 26 成交量, 27 當沖, 28 判別T+1, 29 下單來源, 30 委託方式,
+    31 委託有效日, 32 營業員, 33 預估手續費, 34 預估交易稅, 35 幣別,
+    36 委託日期, 37 委託時間, 38-39 分子/分母, 40 交易單位股數,
+    43 成交價金, 49 成交時間hhmmssfff. Verified live 2026-09-01.
+    """
+    f = raw.split(',')
+    return QueryFillReport(
+        login_id=login_id,
+        market=safe_get(f, 0), product=safe_get(f, 1), exchange=safe_get(f, 2),
+        branch=safe_get(f, 3), account=safe_get(f, 5),
+        order_no=safe_get(f, 7), fill_seq=safe_get(f, 8),
+        fill_date=safe_get(f, 9), fill_time=safe_get(f, 10),
+        symbol=safe_get(f, 12), buy_sell=safe_get(f, 21), session=safe_get(f, 22),
+        stock_flag=safe_get(f, 23), trade_type=safe_get(f, 24),
+        price=safe_get(f, 25), qty=safe_get(f, 26),
+        agent=safe_get(f, 29), price_type=safe_get(f, 30), sale_no=safe_get(f, 32),
+        fee=safe_get(f, 33), tax=safe_get(f, 34),
+        order_date=safe_get(f, 36), order_time=safe_get(f, 37),
+        unit_shares=safe_get(f, 40), amount=safe_get(f, 43), fill_time_ms=safe_get(f, 49),
+        fields=f, raw=raw,
+    )
+
+
+def parse_report_query_result(login_id: str, raw: str, kind: str = "order"):
     """
     Parse the blocking GetOrderReport / GetFulfillReport result string.
 
-    Rows are separated by CRLF and share the OnNewData comma-separated report
-    format. M003 means no data; M999 means query error / issued within the
-    official 5-second interval (raised so callers can retry).
+    Rows are CRLF-separated and use the DEDICATED query formats (official
+    5-4-4 / 5-4-5), NOT the OnNewData layout. kind: "order" or "fill".
+    M003 means no data; M999 means query error / issued within the official
+    5-second interval (raised so callers can retry).
     """
     text = (raw or "").strip()
     if not text or text.startswith("M003"):
         return []
     if text.startswith("M999"):
         raise RuntimeError(f"report query rejected: {text}")
+    parser = parse_query_fill_row if kind == "fill" else parse_query_order_row
     rows = [row.strip() for row in text.replace("\r\n", "\n").split("\n") if row.strip()]
-    return [parse_order_event(login_id, row) for row in rows]
+    return [parser(login_id, row) for row in rows]
 
 
 # ----------------------------------------------------------------------
