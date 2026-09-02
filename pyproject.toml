@@ -1,6 +1,6 @@
 [project]
-name = "capital-api-sdk-rebuilt"
-version = "0.1.0"
+name = "capital-api-sdk"
+version = "1.0.0"
 description = "High-level Python wrapper for Capital Securities / Futures SKCOM.dll"
 requires-python = ">=3.10"
 dependencies = [
@@ -8,6 +8,10 @@ dependencies = [
     "pywin32>=306; platform_system == 'Windows'",
     "python-dotenv>=1.0.0",
 ]
+
+[project.optional-dependencies]
+# Only ticks_to_dataframe() needs pandas, and it imports lazily.
+dataframe = ["pandas>=2.0"]
 
 [tool.setuptools.packages.find]
 include = ["capital_api_sdk*"]
