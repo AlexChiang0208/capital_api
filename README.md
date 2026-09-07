@@ -76,6 +76,10 @@ snapshot = fetch_account_snapshot(client, include=None)   # None = 全部區塊
 
 沒選到的區塊不查詢、不等待，是加速的關鍵。群益查詢會序列化處理，SDK 一律逐項查詢（並行會觸發 `1019 SK_ERROR_QUERY_IN_PROCESSING` 而掉資料）。
 
+**等待機制（不是固定 sleep）**：帳務查詢等的是官方結束標記——資料查詢等 `##` 開頭列（查無資料時為 `001,查無資料,帳號`）、回報連線等 `OnComplete`，收到就返回，`wait_sec` 只是「收不到標記時的等待上限」。實測 `fetch_account_snapshot` 全區塊約 1 秒（原本固定等要 12 秒以上）。
+
+要點：查無資料時官方會**連續送出兩種標記**（先 `001,查無資料`、再補一筆 `##`），SDK 收到標記後會再排空殘留事件才返回，否則殘留的 `##` 會提早結束**下一次**查詢而截斷資料；另外同類查詢連續呼叫會被元件拒絕（官方 5 秒間隔），此時 SDK 直接回空清單、不空等。細節與驗證方法見 [official_mapping.md](docs/official_mapping.md) 的「非同步帳務查詢的結束標記與等待」。
+
 掛單視圖 `client.get_open_orders()` 以官方回報語意彙總：委託(N)/改量(U)/改價(P) 取最新、
 取消(C)與動態退單(S)直接結案、**分批成交(D)逐筆沖銷剩量**、失敗單(OrderErr Y/T)不列入。
 
@@ -91,6 +95,14 @@ rows = client.get_order_report(n_format=1)    # 物件形式：QueryOrderReport�
 ```
 
 ## 報價查詢
+
+> **先確認帳號的行情權限**：收不收得到行情取決於登入帳號，而且權限不足是**靜默失敗**——
+> 例如純期貨帳號訂閱 `2330`，`RequestStocks` / `RequestTicks` 都回 `SK_SUCCESS`，
+> 但報價與 tick 事件**永遠不會觸發**，snapshot 停在 `has_data=False`、ticks 一直 0 筆，
+> 看起來就像程式卡住。用 `fetch_quote_symbol_lists(client, "stock")` 一驗即知：
+> 回 0 筆就是這個帳號拿不到證券行情（官方 `3031`：未開證券戶或未簽證券 API 同意書，
+> 該市場商品檔不會下載），換帳號或改用期貨代碼即可，不必 debug 訂閱程式碼。
+> `examples\04` / `05` / `07` 目前預設用期貨代碼（`TX00` / `MTX00`）就是這個原因。
 
 ### 商品清單
 
@@ -120,7 +132,7 @@ res.ticks["TX00"]             # list[QuoteTick]（tick.history=True 表示當日
 res.order_books["TX08/09"]    # QuoteBest5 五檔
 ```
 
-這是真正的一次性查詢（訂閱→伺服器立即推當前狀態→讀取→取消），資料齊全就提前返回，同一 process 第二次呼叫起通常 <1 秒。**盤後也可查**：snapshot 回最後狀態、ticks 回補當日成交明細。
+這是真正的一次性查詢（訂閱→等到「訂閱後」推來的新資料→讀取→取消 tick 與報價訂閱），資料齊全就提前返回，同一 process 第二次呼叫起通常 <1 秒；查完不留任何訂閱，notebook 閒置時不會累積事件，舊快取也不會被當成最新狀態。**盤後也可查**：snapshot 沒有新事件時等滿 `timeout_sec` 後從元件本地表讀最後狀態、ticks 回補當日成交明細。注意 `ticks` / `orderbook` 都走 RequestTicks，每次都會回補整天成交明細（活躍商品上萬到十幾萬筆事件）；只要價格請用 `data="snapshot"`，last / bid / ask / 漲跌停都在裡面。
 
 單檔便捷包裝：`fetch_quote_snapshot()` / `fetch_quote_ticks()` / `fetch_order_book()` / `fetch_live_quote()`。
 
@@ -244,6 +256,8 @@ OnNewData 的買賣別請用 `OrderEvent.buy_sell`（B/S）；原始 `side` 欄�
 | `examples\06_live_order_reports.py` | 監聽委託/成交回報，不送單。 | 已實測 |
 | `examples\07_live_tick_stream.py` | 逐筆成交串流：首批回補當日全量，之後每 N 秒印新增 DataFrame，並自動偵測/修補 ptr 缺口。需 pandas。 | 已實測 |
 
+`04` / `05` / `07` 的預設商品是**期貨代碼**（`TX00` / `MTX00`），因為目前 `.env` 是純期貨帳號、訂閱證券商品會靜默無資料（見上方報價查詢的權限說明）。帳號有證券行情權限時，把檔頭的 `SYMBOL(S)` 改回股票代碼、`MARKET` 改成 `"stock"` 即可。
+
 ## 專案結構
 
 | 路徑 | 說明 |
@@ -276,7 +290,10 @@ python examples\01_login_accounts.py
 - 期貨**價差商品 K 線**伺服器回 0 筆（即時資料正常，見上方價差章節）。
 - 當日無成交的冷門商品（如深月價差），ticks / orderbook 會等滿 timeout 後回空，屬正常行為。
 - 訂閱**不存在的商品代碼**時，官方 API 靜默略過、不回錯誤；snapshot 會是無資料狀態（`has_data=False`）。
-- SKCOM 的 tick 回補**每檔商品每連線只回補一次**；SDK 以 hub 快取處理同一 process 的重複查詢（`fetch_latest_quotes` 因此預設 `clear=False`）。
+- **帳號沒有該市場行情權限時同樣靜默無資料**（如純期貨帳號訂閱證券商品）：訂閱回 `SK_SUCCESS` 但事件永不觸發，商品清單該市場回 0 筆（官方 `3031`）。與「代碼不存在」症狀相同，先用商品清單區分。
+- 帳務查詢**查無資料時會連送兩種結束標記**（`001,查無資料` 後再補一筆 `##`）；自行實作等待邏輯時必須排空殘留標記，否則會截斷下一次查詢（SDK 已處理，見上方帳務查詢章節）。
+- 同類帳務查詢**連續呼叫會被元件拒絕**（官方 5 秒間隔，回 `1019 SK_ERROR_QUERY_IN_PROCESSING` 且不觸發事件）。SDK 會記住每種查詢上次呼叫的時間，5.5 秒內再查就先等滿間隔；若仍收不到結束標記會重試一次，還是沒有就丟 `CapitalApiError`，**不會回空清單讓你誤以為沒部位**。
+- SKCOM 的 tick 回補：先前記載每檔每連線只回補一次，但 2026-09-03 實測 `cancel_ticks` 後重新 `RequestTicks` **會再回補一次**（微台三次查詢快取了 3 × 17 萬筆）。`fetch_latest_quotes` 以訂閱當下的事件游標判斷資料新舊，舊快取不會被當成最新狀態，因此不需要 `clear=True`；hub 的事件清單改為分批修剪、只為尚未命名的 tick 補 symbol，避免大快取時每筆事件都 O(n)。
 - 群益帳務查詢會**序列化處理**：並行送查詢會觸發 `1019 SK_ERROR_QUERY_IN_PROCESSING` 而掉資料，SDK 一律逐項查詢。
 - 期貨未平倉（GW 格式 1）**不含市價與浮動損益**（官方欄位即無此資料）。
 - 盤中零股與客製化市場（WithMarketNo 5/6/9/10）報價路徑保留但未實測。
@@ -292,7 +309,9 @@ python examples\01_login_accounts.py
 | `3006 SK_SUBJECT_QUOTE_PAGE_EXCEED` | RequestStocks 頁碼超限：固定用頁 1（SDK fetch 系列已處理）。 |
 | `3031 SK_SUBJECT_NO_RELATED_MARKET_STOCKS` | 未簽署證券/期貨 API 下單聲明書，對應市場商品檔不會下載。 |
 | 回報查詢回 `M999` | 查詢間隔未滿 5 秒或前次查詢未完成；等待期間要 pump（SDK 已處理）。 |
-| 查不到 ticks / orderbook | 確認商品代碼（價差換月）、交易時段、`ensure_quote_session` 是否成功。 |
+| 訂閱成功卻**完全收不到報價/tick** | 多半是帳號沒有該市場行情權限（純期貨帳號訂證券最常見）。用 `fetch_quote_symbol_lists(client, "stock")` 驗證：回 0 筆即無權限，改用期貨代碼或換帳號。 |
+| 帳務查詢回空、但確定有部位 | 距上次同類查詢未滿 5 秒被元件拒絕（回非 0 碼、不觸發事件）；間隔 5 秒以上重查。 |
+| 查不到 ticks / orderbook | 確認商品代碼（價差換月）、交易時段、`ensure_quote_session` 是否成功；再確認帳號行情權限（見上）。 |
 | K 線為空 | 確認商品與日期區間；價差商品 K 線不支援（見上）；當日 K 線約 14:45 後才有。 |
 | 掛單查詢不完整 | OnNewData cache 需 `connect_reply=True` 且 pump；或改用 `fetch_order_reports()`。 |
 | 長時間串流斷線 | SDK 已自動保活（15 秒 RequestServerTime）並在重連後自動重訂閱。 |
