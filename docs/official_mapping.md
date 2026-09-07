@@ -72,6 +72,20 @@ SDK 依官方 `CapitalAPI_2.13.58` 手冊（`策略王COM元件使用說明_V2.1
   偵測新的 3003 並自動重新訂閱（tick 回補會在新連線重播一次，`TickStream` 以 ptr 去重）。
 - `SKQuoteLib_IsConnected`：0 斷線 / 1 連線中 / 2 商品檔下載中。
 
+### 帳號權限決定收得到哪些行情（實測 2026-09-03，靜默失敗）
+
+行情能不能收到**取決於登入帳號的權限**，而且權限不足時是**完全靜默**的，沒有錯誤碼、沒有事件：
+
+- 純期貨帳號訂閱證券商品（`2330`、`1101`…）：`RequestStocks` / `RequestTicks` 都回
+  `0 SK_SUCCESS`，但 `OnNotifyQuoteLONG` / `OnNotifyTicksLONG` **永遠不會觸發**——
+  snapshot 停在 `has_data=False`、ticks 一直 0 筆，看起來像程式卡住或 SDK 壞掉，實際是權限問題。
+- 同一帳號 `RequestStockList(0)` / `(1)`（上市/上櫃）回 **0 筆**，期貨市場（2）則正常回全量；
+  對應官方 `3031 SK_SUBJECT_NO_RELATED_MARKET_STOCKS`：未開證券戶或未簽署證券 API 同意書時，
+  該市場的商品檔根本不會下載。
+- 對照驗證：同一條連線訂閱 `TX00` 立刻回補當日數萬筆 tick，可證明連線與訂閱路徑本身正常。
+- **建議的判斷方式**：先 `fetch_quote_symbol_lists(client, "stock")`，回 0 筆就代表這個帳號拿不到
+  證券行情，換帳號或改用期貨代碼，不要浪費時間 debug 訂閱程式碼。
+
 ## 官方報價規則（V2.13.58 手冊，實測確認）
 
 - `SKQuoteLib_RequestStocks(psPageNo, bstrStockNos)`：psPageNo「請固定帶 1」，一般用戶頁碼上限 1；
@@ -140,8 +154,12 @@ SDK 依官方 `CapitalAPI_2.13.58` 手冊（`策略王COM元件使用說明_V2.1
 - 同步阻塞查詢；rows 以 `\r\n` 分隔；`M003` 查無資料、`M999` 查詢錯誤。
 - **rows 使用專用查詢格式（5-4-4 委託 / 5-4-5 成交），與 OnNewData 完全不同**，
   SDK 以 `QueryOrderReport` / `QueryFillReport` 解析（實測與官方欄位表逐欄核對）。
-- **限制每次查詢間隔 5 秒**，且等待期間必須 pump COM 訊息，否則前次查詢不會標記完成、一直回 `M999`
-  （SDK `_sync_report_query` 已自動處理間隔與重試）。
+- **限制每次查詢間隔 5 秒**，且等待期間必須 pump COM 訊息，否則前次查詢不會標記完成、一直回
+  `M999 有查詢尚未結束或前次查詢後尚未等候五秒`。實測 2026-09-04：閒置 30 秒完全不 pump 再查 → M999，
+  pump 0.2 秒後同一查詢就成功；剛送出委託 / 刪單後也可能短暫回 M999。這個限制是**元件內部**的，
+  不是伺服器依登入帳號共用：另一個 process 同時查不會互相觸發（實測）。
+  SDK `_sync_report_query` 會先 pump 0.3 秒、每次重試前等滿 5.5 秒間隔、最多重試 3 次，仍失敗才丟
+  `CapitalApiError`（RuntimeError 子類，訊息含 M999 原文）。
 - 帳號必須是 TS/TF 交易帳號（一戶通帳號回 `M999 ... is invalid`）。
 - 手冊備註寫「回報不含盤中零股」，**實測 2.13.58 查得到盤中零股**（盤別欄 = `F`）。
 - `GetOrderReport` nFormat：1 全部 / 2 有效 / 3 可消 / 4 已消 / 5 已成 / 6 失敗 / 7 合併同價格 / 8 合併同商品 / 9 預約
@@ -177,14 +195,62 @@ SDK 依官方 `CapitalAPI_2.13.58` 手冊（`策略王COM元件使用說明_V2.1
 
 ### OnOpenInterest 期貨未平倉（GetOpenInterestGW nFormat=1，10 欄，0-based）
 
-0 市場別(TM)、1 帳號、2 商品、3 買賣別、4 未平倉部位、5 當沖未平倉部位、
+0 市場別(實測 TF)、1 帳號、2 商品、3 買賣別、4 未平倉部位、5 當沖未平倉部位、
 6 平均成本(小數已處理)、7 單口手續費、8 交易稅(萬分之X)、9 LOGIN_ID。
-GW 格式 1 **不含市價與浮動損益**；查無資料回 `001,查無資料,帳號`。
+GW 格式 1 **不含市價與浮動損益**；查無資料回 `001,查無資料,帳號`
+（實測：之後還會再補一筆 `##` 列，見下方「非同步帳務查詢的結束標記與等待」）。
+實測列（2026-09-03，1 口微台多單）：`TF,<帳號>,TM09,B,1,0,46560.00,,,<LOGIN>` → 買賣別是 **B/S**，
+手續費 / 交易稅兩欄**空白**，而且商品代號是**庫存表專用的第三套代碼**（微台 `TM09` = TM + MM；
+報價端是 `TM2609`、回報 / 刪單是 `TMFI6`）。三套代碼的對應與轉換在 `capital_api_sdk/taifex.py`
+（`contract_of` / `to_report_code` / `point_value`），欄位中文名在 `models.FUTURE_POSITION_FIELDS`。
+`taifex.py` **目前只收錄 TX / MTX / TM**，其他商品一律視為未知（不猜乘數）；各商品代碼格式不一致
+（TX + MM、TM + YYMM、庫存表 TM09），新增商品時三套代碼都要實機確認，步驟寫在 `taifex.py` 檔頭。
 
-### OnFutureRights 期貨權益數（41 欄，0-based，SDK 取用欄位）
+### OnFutureRights 期貨權益數（41 欄，0-based，SDK 全部解出）
 
-6 權益數、7 超額保證金、13 原始保證金、14 維持保證金、17 委託保證金、
-25 幣別、31 可用餘額、34 風險指標、39 LOGIN_ID、40 ACCOUNT_NO（完整 41 欄見手冊 4-2-i）。
+`FutureRights` 有 41 個屬性，順序 = 官方欄位順序，中文對照在 `models.FUTURE_RIGHTS_FIELDS`
+（括號內為策略王「期貨權益」畫面名稱）。2026-09-03 對照畫面驗證：
+權益數[6] = 權益總值[19]；超額/追繳保證金[7] = 超額最佳[18]；
+可用餘額[31] = 足額可用[28] = 足額現金可用[32] = 權益數 − 部位原始保證金[15] − 委託保證金[17]；
+原始保證金[13] = 部位原始[15] + 委託[17]（畫面上的「原始保證金」是 [15]）；
+風險指標[34] = 維持率[24] = 權益數 / 部位原始保證金 × 100。無部位時 [24] / [34] 回 `*********`。
+
+### GetOrderReport 期貨列補充（5-4-4，0-based）
+
+15 商品代號是**交易所契約代碼**（`TMFI6`），16 Tandem 商品代號1 單腳期貨也會填（`FITM`），
+17 Tandem 契約年月1 = `202609`（可用來確定 `TMFI6` 的年份），14 委託有效日；
+期貨列的盤別(23)為空白（策略王畫面顯示「一般」）。SDK 對應 `valid_date` / `leg1_product` / `leg1_month`，
+中文名在 `models.QUERY_ORDER_FIELDS`。
+
+### 非同步帳務查詢的結束標記與等待（實測 2026-09-03）
+
+`GetRealBalanceReport` / `GetOpenInterestGW` / `GetFutureRights` 都是「呼叫後由事件分批回傳」。
+官方備註明文：**「當全部資料已經全部回傳完畢，將回傳一筆以『##』開頭的內容，表示查詢結束」**，
+查無資料則回 `001,查無資料,帳號`。SDK 以這個標記取代固定 `pump(wait_sec)` 等待，
+`wait_sec` 降級為「收不到標記時的等待上限」，行為與舊版等價但通常快一個數量級。
+
+實測要點（這些是提早返回的**正確性前提**，改動等待邏輯前務必先讀）：
+
+- **查無資料時兩種標記會同時出現**：先 `001,查無資料,帳號`，之後才補一筆 `##,,,,`。
+  只等到第一筆就返回，第二筆會留在 COM 訊息佇列裡；下一次查詢 clear 之後第一個 pump 就撞上這筆
+  殘留標記、誤判「已結束」而**截斷真正的資料**。SDK 因此在收到標記後再做靜止排空
+  （0.3 秒沒有新列才返回），且每次查詢前先 flush 再 clear（`_begin_account_query`）。
+- **同類查詢連續呼叫會被元件拒絕**（官方查詢間隔限制，實測 5 秒內回 `1019 SK_ERROR_QUERY_IN_PROCESSING`）：
+  回傳非 0 錯誤碼且**不會觸發任何事件**，被拒或逾時的查詢**不會有結束標記**。
+  SDK（`CapitalClient._account_query`）記住每種查詢上次呼叫時間，間隔不足就先 pump 等滿 5.5 秒；
+  若仍收不到結束標記就重試一次，還是沒有則丟 `CapitalApiError`，不再回空清單（空清單會被誤判成「沒部位」）。
+- 標記列不是資料，SDK 回傳前一律濾除（`models.is_report_end_row`，`snapshot.is_real_row` 共用同一判斷）。
+- 驗證方法：查詢返回後再多 pump 數秒，若出現「晚到的資料列」就代表被截斷。
+  實測期貨未平倉/權益數約 0.1–0.5 秒返回（原固定等 2–3 秒），且無晚到列。
+
+其他非同步等待的對應標記：
+
+| 動作 | 結束標記 | SDK |
+|---|---|---|
+| 回報連線 `SKReplyLib_ConnectByID` | **`OnComplete`**（當日回報回補完成） | `client.wait_reply_complete()`（`connect_reply` 內建） |
+| 帳號查詢 `GetUserAccount` / `OnAccount` | **無標記**（一次爆發回完） | 「有資料且靜止 0.5 秒」判定 |
+| 商品清單 `RequestStockList` / `OnNotifyStockList` | `##` 列 | `client.request_stock_list()`；3003 之後讀本機商品檔，實測 1.2 萬檔約 0.1 秒 |
+| tick 當日回補 | **無標記**（官方只有 K 線有 `OnKLineComplete`） | `TickStream.collect(idle_stop=True)` 以事件靜止判定 |
 
 ## 期貨價差商品（實測）
 
