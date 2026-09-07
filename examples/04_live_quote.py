@@ -26,8 +26,10 @@ from capital_api_sdk import (  # noqa: E402
 )
 
 # ===== Settings =====
-MARKET = "stock"                                 # "stock" / "future" (label only; spreads work too)
-SYMBOLS = ["1101", "0056"]
+# 純期貨帳號訂閱證券商品(如 2330/1101)會「訂閱成功但收不到任何資料」,
+# 帳號有證券行情權限時再把 SYMBOLS 改回股票代碼即可。
+MARKET = "future"                                # "stock" / "future" (label only; spreads work too)
+SYMBOLS = ["TX00", "MTX00"]  # Example stock symbols
 DATA_KINDS = ("snapshot", "ticks", "orderbook")  # any subset
 RUN_SECONDS = 20.0                               # None = stream until Ctrl+C
 PUMP_INTERVAL_SEC = 0.2

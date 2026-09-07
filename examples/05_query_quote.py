@@ -55,7 +55,10 @@ symbol_lists = fetch_quote_symbol_lists(client, MARKETS)
 # 每個市場一張完整 DataFrame(不截斷);Interactive 視窗可捲動、也可 .to_csv() 匯出
 symbol_tables = {
     market: pd.DataFrame(
-        [{"symbol": it.symbol, "name": it.name, "fields": it.fields} for it in rows]
+        [{"symbol": it.symbol, "name": it.name, "fields": it.fields} for it in rows],
+        # 指定欄位, 空市場也要有 symbol 欄, 否則下面取 t["symbol"] 會 KeyError。
+        # 純期貨帳號查上市/上櫃會回 0 筆(未開證券戶或未簽證券 API 同意書, 錯誤代碼 3031)。
+        columns=["symbol", "name", "fields"],
     )
     for market, rows in symbol_lists.markets.items()
 }
@@ -92,9 +95,11 @@ spread_table
 #   SYMBOLS = ("2330",);                DATA = "live"       → 台積電全部資料
 #   SYMBOLS = ("2330", "0050");         DATA = "snapshot"   → 兩檔現貨快照
 #   SYMBOLS = ("TX00",);                DATA = "orderbook"  → 台指近月五檔
-#   SYMBOLS = ("TX08/09", "CDF08/09");  DATA = "live"       → 期貨價差(台指/台積電)
+#   SYMBOLS = ("TX09/10", "CDF09/10");  DATA = "live"       → 期貨價差(台指/台積電)
 #   SYMBOLS = ("2330", "TX00");         DATA = "ticks"; MAX_TICKS = None → 當日全部成交明細
-SYMBOLS = ("2330", "TX00", "TX08/09")
+# 價差代碼每次換月都會失效(過期的代碼查不到任何資料,不會報錯),先用 01 節的
+# 商品清單確認當期代碼再填。純期貨帳號查現貨(2330)會全部回空,那是帳號權限問題。
+SYMBOLS = ("TX00", "TX09/10", "MTX00")
 DATA = "live"
 MAX_TICKS = 5
 
@@ -160,7 +165,8 @@ orderbook_table
 #   SYMBOLS = ("TX00",); LINE_TYPE = "minute"; SESSION = 1                → 台指分K(只要日盤)
 #   SYMBOLS = ("2330", "TX00"); LINE_TYPE = "week"; DAYS = 180            → 多檔週K
 #   START_DATE = "2026-07-01"; END_DATE = "2026-07-25"                    → 指定區間
-SYMBOLS = ("2330", "TX00")
+# 純期貨帳號查現貨 K 線(2330)會回 0 筆並浪費等待時間,有證券權限再加回去。
+SYMBOLS = ("TX00", "MTX00")
 LINE_TYPE = "minute"
 DAYS = 3
 MINUTE_NUMBER = 15

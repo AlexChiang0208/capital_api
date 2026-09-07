@@ -36,8 +36,10 @@ from capital_api_sdk import (  # noqa: E402
 )
 
 # ===== Settings =====
-SYMBOL = "2330"
-MARKET = "stock"              # "stock" / "future"; odd-lot needs "oddlot-listed"
+# 純期貨帳號收不到證券商品資料(訂 2330 會整天空白);有證券行情權限的帳號
+# 可改回 SYMBOL = "2330", MARKET = "stock"。
+SYMBOL = "TX00"
+MARKET = "future"             # "stock" / "future"; odd-lot needs "oddlot-listed"
 INTERVAL_SEC = 5.0            # print a new DataFrame every N seconds
 RUN_SECONDS = 60.0            # streaming time after the backfill; None = until Ctrl+C
 BACKFILL_TIMEOUT_SEC = 60.0   # cap for the first batch (a busy morning is tens of thousands of ticks)
