@@ -3,3 +3,5 @@ __pycache__
 capital_api_sdk.egg-info
 official/
 logs/
+account_env/
+_dev_checks/
