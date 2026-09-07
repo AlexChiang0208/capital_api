@@ -547,6 +547,9 @@ class _RealtimeSession:
     market_no: int | None
     tick_symbols: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    quote_subscribed: bool = False   # RequestStocks accepted -> cancel it when the session finishes
+    quote_cursor: int = 0            # hub event cursors taken right before subscribing: rows before them
+    best5_cursor: int = 0            # were left by earlier calls and must never count as "fresh"
 
 
 def _start_realtime_session(
@@ -590,6 +593,7 @@ def _start_realtime_session(
             f"RequestStocks handles at most {MAX_QUOTE_SYMBOLS} symbols; extra symbols are ignored by SKCOM."
         )
 
+    _, session.quote_cursor, session.best5_cursor = client.hub.quote_event_totals()
     _subscribe_realtime_session(client, session)
     return session
 
@@ -604,6 +608,7 @@ def _subscribe_realtime_session(client: CapitalClient, session: _RealtimeSession
     # Quote subscription always runs: it feeds snapshot values and lets the hub
     # map tick/best5 events (keyed by market_no+index) back to symbols.
     result = client.subscribe_quotes(session.symbols, page_no=QUOTE_PAGE_NO, market_no=session.market_no)
+    session.quote_subscribed = result.ok
     if not result.ok:
         session.errors.append(_api_result_message(result))
 
@@ -623,6 +628,12 @@ def _subscribe_realtime_session(client: CapitalClient, session: _RealtimeSession
 
 
 def _finish_realtime_session(client: CapitalClient, session: _RealtimeSession) -> None:
+    """Leave nothing subscribed behind: cancel the tick pages AND the RequestStocks page.
+
+    A lingering quote subscription keeps pushing OnNotifyQuoteLONG events. In a process that only
+    pumps while a query runs (a notebook), those events queue up between calls and the next query
+    has to digest all of them before it sees its own reply.
+    """
     for symbol in session.tick_symbols:
         try:
             result = client.cancel_ticks(symbol)
@@ -630,6 +641,13 @@ def _finish_realtime_session(client: CapitalClient, session: _RealtimeSession) -
                 session.errors.append(_api_result_message(result))
         except Exception as exc:
             session.errors.append(f"SKQuoteLib_CancelRequestTicks failed for {symbol}: {exc}")
+    if session.quote_subscribed:
+        try:
+            result = client.cancel_quotes(session.symbols)
+            if not result.ok:
+                session.errors.append(_api_result_message(result))
+        except Exception as exc:
+            session.errors.append(f"SKQuoteLib_CancelRequestStocks failed: {exc}")
 
 
 def _read_realtime_result(
@@ -656,7 +674,7 @@ def _read_realtime_result(
                 rows = rows[-int(max_ticks):]
             ticks[symbol] = rows
         if "orderbook" in session.kinds:
-            order_books[symbol] = _read_order_book(client, symbol, snapshot)
+            order_books[symbol] = _read_order_book(client, session, symbol, snapshot)
 
     return RealtimeQuoteResult(
         market=str(session.market or ""),
@@ -668,11 +686,44 @@ def _read_realtime_result(
     )
 
 
+def _fresh_snapshot(client: CapitalClient, session: _RealtimeSession, symbol: str) -> QuoteSnapshot | None:
+    """Newest quote event for symbol that arrived AFTER this session subscribed.
+
+    Older cached rows are whatever an earlier call left behind; treating them as "ready" would
+    hand back a stale price instantly, which is exactly what a one-shot "latest state" query
+    must not do.
+    """
+    events, _ = client.hub.get_quotes_since(session.quote_cursor)
+    for quote in reversed(events):
+        if quote.symbol == symbol and quote.has_data:
+            return quote
+    return None
+
+
+def _fresh_best5(
+    client: CapitalClient,
+    session: _RealtimeSession,
+    symbol: str,
+    snapshot: QuoteSnapshot | None,
+) -> QuoteBest5 | None:
+    """Newest best5 event for symbol (or its market_no/stock_index key) received after subscribing."""
+    key = None
+    if snapshot is not None and snapshot.market_no is not None and snapshot.stock_index is not None:
+        key = (int(snapshot.market_no), int(snapshot.stock_index))
+    events, _ = client.hub.get_best5_since(session.best5_cursor)
+    for best5 in reversed(events):
+        if best5.symbol == symbol or (key is not None and (int(best5.market_no), int(best5.stock_index)) == key):
+            return best5
+    return None
+
+
 def _read_snapshot(client: CapitalClient, session: _RealtimeSession, symbol: str) -> QuoteSnapshot | None:
-    """Prefer the event cache; fall back to the direct COM getter."""
+    """Fresh event from this session first; otherwise ask the component directly (its table holds
+    the current values even when no event fired, e.g. after hours); the stale cache is the last resort."""
+    fresh = _fresh_snapshot(client, session, symbol)
+    if fresh is not None:
+        return fresh
     cached = client.hub.get_latest_quote(symbol)
-    if cached is not None and cached.has_data:
-        return cached
     try:
         fetched = client.get_quote_snapshot(symbol, market_no=session.market_no, wait_sec=0.0)
     except Exception as exc:
@@ -683,41 +734,43 @@ def _read_snapshot(client: CapitalClient, session: _RealtimeSession, symbol: str
     return cached
 
 
-def _read_order_book(client: CapitalClient, symbol: str, snapshot: QuoteSnapshot | None) -> QuoteBest5 | None:
-    rows = client.hub.get_latest_best5(symbol=symbol)
-    if rows:
-        return rows[-1]
+def _read_order_book(
+    client: CapitalClient,
+    session: _RealtimeSession,
+    symbol: str,
+    snapshot: QuoteSnapshot | None,
+) -> QuoteBest5 | None:
+    """Same order of preference as _read_snapshot: fresh event, component getter, stale cache."""
+    fresh = _fresh_best5(client, session, symbol, snapshot)
+    if fresh is not None:
+        return fresh
     if snapshot is not None and snapshot.market_no is not None and snapshot.stock_index is not None:
-        book = client.hub.get_latest_best5_by_key(int(snapshot.market_no), int(snapshot.stock_index))
-        if book is not None:
-            return book
-        return client.get_best5_by_index(
+        book = client.get_best5_by_index(
             int(snapshot.market_no),
             int(snapshot.stock_index),
             decimal_places=snapshot.decimal_places,
             symbol=symbol,
         )
-    return None
+        if book is not None:
+            return book
+    rows = client.hub.get_latest_best5(symbol=symbol)
+    return rows[-1] if rows else None
 
 
 def _realtime_data_ready(client: CapitalClient, session: _RealtimeSession) -> bool:
-    """True when every requested data kind has a cached row per symbol.
+    """True when every requested kind has FRESH data (received after subscribing) for every symbol.
 
-    Reads the hub cache only (no COM getters) so it is cheap and side-effect
-    free while pump_until polls it.
+    Reads the hub only (no COM getters) so it is cheap and side-effect free while pump_until
+    polls it. Ticks count as ready once any tick for the symbol is cached: the backfill supplies them.
     """
     for symbol in session.symbols:
-        quote = client.hub.get_latest_quote(symbol)
-        if "snapshot" in session.kinds and (quote is None or not quote.has_data):
+        snapshot = _fresh_snapshot(client, session, symbol)
+        if "snapshot" in session.kinds and snapshot is None:
             return False
         if "ticks" in session.kinds and not client.hub.get_ticks(symbol=symbol, max_count=1):
             return False
-        if "orderbook" in session.kinds:
-            book = client.hub.get_latest_best5(symbol=symbol)
-            if not book and quote is not None and quote.market_no is not None and quote.stock_index is not None:
-                book = client.hub.get_latest_best5_by_key(int(quote.market_no), int(quote.stock_index))
-            if not book:
-                return False
+        if "orderbook" in session.kinds and _fresh_best5(client, session, symbol, snapshot) is None:
+            return False
     return True
 
 
@@ -737,16 +790,20 @@ def fetch_latest_quotes(
 ) -> RealtimeQuoteResult:
     """
     One-shot "latest state" query: subscribe, wait until every requested kind has
-    data (or timeout), read, then cancel tick subscriptions.
+    FRESH data (received after subscribing) or the timeout passes, read, then cancel
+    the tick AND quote subscriptions so nothing keeps streaming afterwards.
 
-    Thanks to the SKCOM tick backfill this also works outside trading hours:
-    ticks return today's (or the last session's) trades, and snapshots return the
-    last known values. max_ticks=1 keeps only the newest tick per symbol; set
-    None to keep the whole backfill.
+    Rows cached by earlier calls never satisfy the wait. When no new event arrives
+    within timeout_sec (e.g. after hours) the snapshot is read from the component's
+    own table through the COM getter, so the call still works outside trading hours;
+    ticks then come from the backfill of the last session.
 
-    clear defaults to False because SKCOM only backfills ticks once per symbol
-    per connection — clearing the cache would make repeated one-shot queries in
-    the same session lose their tick data outside trading hours.
+    Cost note: "ticks" and "orderbook" both need RequestTicks, and every RequestTicks
+    makes SKCOM replay the whole day's ticks (tens of thousands of events for an
+    active contract) into this process before the live feed. For a price check use
+    data="snapshot": last / bid / ask / limits are all in it and nothing is replayed.
+    max_ticks=1 keeps only the newest tick per symbol; None keeps the whole backfill.
+    clear=True wipes the hub cache first (rarely needed now that freshness is enforced).
     """
     session = _start_realtime_session(
         client, symbols,
@@ -764,6 +821,7 @@ def fetch_latest_quotes(
         _drain_quote_events(client, timeout_sec=remaining)
     result = _read_realtime_result(client, session, max_ticks=max_ticks)
     _finish_realtime_session(client, session)
+    result.quote_errors = list(dict.fromkeys(result.quote_errors + session.errors))   # include cancel errors
     return result
 
 

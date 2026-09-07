@@ -151,7 +151,10 @@ class QueryOrderReport:
     status: str = ""
     order_date: str = ""
     order_time: str = ""
-    symbol: str = ""
+    valid_date: str = ""       # 委託有效日 yyyyMMdd (field 14)
+    symbol: str = ""           # exchange contract code for futures (TMFI6), not the quote code (TM2609)
+    leg1_product: str = ""     # Tandem 商品代號1: futures product id such as FITM / FITX (field 16)
+    leg1_month: str = ""       # Tandem 契約年月1 yyyyMM, e.g. 202609 (field 17); the year TMFI6 only implies
     buy_sell: str = ""         # B/S
     session: str = ""
     stock_flag: str = ""
@@ -184,6 +187,25 @@ class QueryOrderReport:
     def is_open(self) -> bool:
         """Cancellable / working states: 5 部分成交剩餘可取消, 7 委託成功, 0 預約."""
         return self.status in ("0", "5", "7")
+
+
+# QueryOrderReport attribute -> 中文 (official 5-4-4 names; parentheses = wording on the 策略王 委回 screen).
+# The screen shows the QUOTE code (TM2609) while the query returns the exchange code (TMFI6), and it
+# folds day_trade / buy_sell / trade_type / session into one "新倉買進ROD一般" column.
+QUERY_ORDER_FIELDS: dict[str, str] = {
+    "market": "市場別", "product": "商品別", "exchange": "交易所別", "branch": "分公司代號", "account": "交易帳號",
+    "order_no": "委託書號", "seq_no": "13碼電子流水號(委託序號)", "orig_seq_no": "原始13碼電子流水號",
+    "status": "委託狀態碼", "status_name": "委託狀態", "order_date": "委託日期", "order_time": "委託時間",
+    "valid_date": "委託有效日", "symbol": "商品代號(交易所契約代碼)",
+    "leg1_product": "Tandem商品代號1(期貨商品代號)", "leg1_month": "Tandem契約年月1(契約年月)",
+    "buy_sell": "買賣別(B/S)", "session": "盤別", "stock_flag": "國內證券委託條件",
+    "trade_type": "委託條件(0 ROD/1 GTC/3 IOC/4 FOK)", "price_type": "委託方式(1 市價/2 限價/3 範圍市價)",
+    "price": "委託價", "orig_price": "原始委託價格", "valid_qty": "有效委託數量",
+    "orig_qty": "原始委託數量(委託量)", "filled_qty": "成交數量(成交量)", "remaining_qty": "剩餘數量",
+    "day_trade": "當沖註記(Y 當沖/N 新倉/O 平倉/A 自動)", "error_mark": "是否錯誤回報", "agent": "下單來源別",
+    "unit_shares": "交易單位股數", "reserved_price_mark": "證券預約單價格註記", "sale_no": "營業員",
+    "avg_fill_price": "成交均價", "cancel_qty": "取消總量", "fill_date": "成交日", "fill_time": "成交時間",
+}
 
 
 @dataclass(slots=True)
@@ -249,9 +271,27 @@ class StockPosition:
     raw: str = ""
 
 
+# GetOpenInterestGW nFormat=1 row (official 4-2-x OnOpenInterest, 10 fields), attribute -> 中文.
+# Verified live 2026-09-03: "TF,<account>,TM09,B,1,0,46560.00,,,<login>" -> 買賣別 is B/S, 手續費 /
+# 交易稅 are EMPTY, and the symbol is the POSITION-TABLE code (微台 TM09 = TM + MM), which differs from
+# both the quote code (TM2609) and the exchange code used by reports (TMFI6); see taifex.contract_of.
+FUTURE_POSITION_FIELDS: dict[str, str] = {
+    "market_type": "市場別",
+    "account_no": "帳號",
+    "symbol": "商品(庫存表代碼)",
+    "buy_sell": "買賣別(B/S)",
+    "open_qty": "未平倉(含當沖)",
+    "day_trade_qty": "當沖未平倉",
+    "avg_price": "成交均價(平均成本)",
+    "fee": "單口手續費",
+    "tax": "交易稅",
+    "login_id": "LOGIN_ID",
+}
+
+
 @dataclass(slots=True)
 class FuturePosition:
-    """One GetOpenInterestGW (nFormat=1) row; see parsers.parse_future_position_raw."""
+    """One GetOpenInterestGW (nFormat=1) row; field meanings in FUTURE_POSITION_FIELDS."""
     market_type: str = ""
     symbol: str = ""
     buy_sell: str = ""
@@ -265,18 +305,104 @@ class FuturePosition:
     raw: str = ""
 
 
+# OnFutureRights row (official 4-2-i, 41 fields): position in this dict = 0-based field index.
+# 中文 follows the official table; parentheses give the name shown on the 策略王 期貨權益 screen.
+# Verified 2026-09-03 against that screen: 權益數[6] = 權益總值[19]; 超額保證金[7] = 超額最佳[18];
+# 可用餘額[31] = 足額可用[28] = 足額現金可用[32] = 權益數 - 部位原始保證金[15] - 委託保證金[17];
+# 原始保證金[13] = 部位原始[15] + 委託[17] (the screen's "原始保證金" is [15]);
+# 風險指標[34] = 維持率[24] = 權益數 / 部位原始保證金 x 100 (14257 = 142.57%).
+# With no position 風險指標 / 維持率 come back as "*********" (keep as text).
+FUTURE_RIGHTS_FIELDS: dict[str, str] = {
+    "cash_balance": "帳戶餘額(本日餘額)",
+    "floating_pnl": "未沖銷期貨浮動損益",
+    "realized_fee": "已實現費用(手續費)",
+    "tax": "交易稅(期交稅)",
+    "premium_withheld": "預扣權利金(委託權利金)",
+    "premium_paid": "權利金收付(權利金收入與支出)",
+    "equity": "權益數",
+    "excess_margin": "超額/追繳保證金",
+    "deposit_withdraw": "存提款(存提)",
+    "buy_option_value": "未沖銷買方選擇權市值",
+    "sell_option_value": "未沖銷賣方選擇權市值",
+    "closed_pnl": "期貨平倉損益淨額",
+    "intraday_unrealized": "盤中未實現(期貨部位未實現)",
+    "initial_margin": "原始保證金(部位+委託)",
+    "maintenance_margin": "維持保證金(部位+委託)",
+    "position_initial_margin": "部位原始保證金(畫面:原始保證金)",
+    "position_maintenance_margin": "部位維持保證金(畫面:維持保證金)",
+    "order_margin": "委託保證金",
+    "best_excess_margin": "超額最佳保證金",
+    "total_equity": "權益總值",
+    "fee_withheld": "預扣費用",
+    "initial_margin_dup": "原始保證金(官方重複欄)",
+    "yesterday_balance": "昨日餘額(前日餘額)",
+    "option_combo_margin_flag": "選擇權組合單加不加收保證金",
+    "maintenance_ratio": "維持率(權益比率)",
+    "currency": "幣別",
+    "full_initial_margin": "足額原始保證金",
+    "full_maintenance_margin": "足額維持保證金",
+    "full_available": "足額可用",
+    "collateral_amount": "有價證券抵繳總額",
+    "securities_available": "有價可用",
+    "available_balance": "可用餘額(可動用/出金保證金)",
+    "full_cash_available": "足額現金可用",
+    "securities_value": "有價證券價值",
+    "risk_indicator": "風險指標",
+    "option_expiry_diff": "選擇權到期差益",
+    "option_expiry_loss": "選擇權到期差損",
+    "futures_expiry_pnl": "期貨到期損益(到期履約損益)",
+    "extra_margin": "加收保證金",
+    "login_id": "LOGIN_ID",
+    "account_no": "帳號",
+}
+# Text-only fields; every other FutureRights field is a number (or "*********" when undefined).
+FUTURE_RIGHTS_TEXT_FIELDS = frozenset({"currency", "option_combo_margin_flag", "login_id", "account_no"})
+
+
 @dataclass(slots=True)
 class FutureRights:
+    """One OnFutureRights row: all 41 official fields as strings, meanings in FUTURE_RIGHTS_FIELDS."""
+    cash_balance: str = ""
+    floating_pnl: str = ""
+    realized_fee: str = ""
+    tax: str = ""
+    premium_withheld: str = ""
+    premium_paid: str = ""
     equity: str = ""
     excess_margin: str = ""
-    available_balance: str = ""
+    deposit_withdraw: str = ""
+    buy_option_value: str = ""
+    sell_option_value: str = ""
+    closed_pnl: str = ""
+    intraday_unrealized: str = ""
     initial_margin: str = ""
     maintenance_margin: str = ""
+    position_initial_margin: str = ""
+    position_maintenance_margin: str = ""
     order_margin: str = ""
-    risk_indicator: str = ""
+    best_excess_margin: str = ""
+    total_equity: str = ""
+    fee_withheld: str = ""
+    initial_margin_dup: str = ""
+    yesterday_balance: str = ""
+    option_combo_margin_flag: str = ""
+    maintenance_ratio: str = ""
     currency: str = ""
-    account_no: str = ""
+    full_initial_margin: str = ""
+    full_maintenance_margin: str = ""
+    full_available: str = ""
+    collateral_amount: str = ""
+    securities_available: str = ""
+    available_balance: str = ""
+    full_cash_available: str = ""
+    securities_value: str = ""
+    risk_indicator: str = ""
+    option_expiry_diff: str = ""
+    option_expiry_loss: str = ""
+    futures_expiry_pnl: str = ""
+    extra_margin: str = ""
     login_id: str = ""
+    account_no: str = ""
     raw: str = ""
 
 
@@ -397,6 +523,14 @@ class RealtimeQuoteResult:
     order_books: dict[str, QuoteBest5 | None] = field(default_factory=dict)
     quote_errors: list[str] = field(default_factory=list)
 
+    @property
+    def subscription_refused(self) -> bool:
+        """True when RequestStocks / RequestTicks itself was rejected (typically 3030: the account's
+        quote connections are exhausted). Matches the subscribe method names only, so a failed
+        CancelRequestStocks at the end of a one-shot query does not count."""
+        return any(error.startswith(("SKQuoteLib_RequestStocks", "SKQuoteLib_RequestTicks"))
+                   for error in self.quote_errors)
+
 
 @dataclass(slots=True)
 class QuoteDataResult:
@@ -491,6 +625,28 @@ class Side(IntEnum):
     SELL = 1
 
 
+_SIDE_CODES = {
+    "B": "B", "S": "S", "0": "B", "1": "S",
+    "BUY": "B", "SELL": "S", "LONG": "B", "SHORT": "S",
+    "買": "B", "賣": "S", "買進": "B", "賣出": "S",
+}
+
+
+def normalize_side(value: Any) -> str:
+    """Any buy/sell spelling -> "B" / "S"; raises ValueError for anything else.
+
+    Accepts Side, 0/1 (FUTUREORDER.sBuySell encoding), B/S (GetOrderReport and
+    GetOpenInterestGW rows, verified live 2026-09-03), buy/sell/long/short and 買/賣.
+    Never guesses: a wrong side flips a position's sign in any exposure calculation.
+    """
+    if isinstance(value, Side):
+        return "B" if value == Side.BUY else "S"
+    text = str(value).strip().upper()
+    if text in _SIDE_CODES:
+        return _SIDE_CODES[text]
+    raise ValueError(f"unknown buy/sell code: {value!r}")
+
+
 class TradeType(IntEnum):
     ROD = 0
     IOC = 1
@@ -580,3 +736,13 @@ class CapitalApiLiveOrderDisabled(CapitalApiError):
 
 class CapitalApiCallError(CapitalApiError):
     """Raised when an API method returns a non-zero code and strict mode is enabled."""
+
+
+def is_report_end_row(raw: str) -> bool:
+    """True for the rows SKCOM appends to close an account query.
+
+    Either the "##,,,,..." terminator (official: 當全部資料已經全部回傳完畢,
+    將回傳一筆以「##」開頭的內容) or the "001,查無資料,帳號" empty-result row.
+    Receiving one means the batch is complete, so callers can stop waiting.
+    """
+    return raw.startswith("##") or "查無資料" in raw

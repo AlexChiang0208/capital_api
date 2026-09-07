@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .models import (
+    FUTURE_RIGHTS_FIELDS,
     Account,
     CapitalPayBalance,
     FuturePosition,
@@ -150,26 +151,10 @@ def parse_future_position_raw(raw: str) -> FuturePosition:
 
 
 def parse_future_rights_raw(raw: str) -> FutureRights:
-    """
-    Best-effort parser using SKDLLPythonTester FutureRights struct field order.
-    Important fields: Equity index 6, ExcessMargin index 7, InitialMargin index 13,
-    MaintenanceMargin index 14, OrderMargin index 17, Currency index 25,
-    AvailableBalance index 31, RiskIndicator index 34.
-    """
+    """Parse one OnFutureRights row: all 41 official fields (4-2-i) in table order, see FUTURE_RIGHTS_FIELDS."""
     f = raw.split(',')
-    return FutureRights(
-        equity=safe_get(f, 6),
-        excess_margin=safe_get(f, 7),
-        initial_margin=safe_get(f, 13),
-        maintenance_margin=safe_get(f, 14),
-        order_margin=safe_get(f, 17),
-        currency=safe_get(f, 25),
-        available_balance=safe_get(f, 31),
-        risk_indicator=safe_get(f, 34),
-        login_id=safe_get(f, 39),
-        account_no=safe_get(f, 40),
-        raw=raw,
-    )
+    values = {name: safe_get(f, index) for index, name in enumerate(FUTURE_RIGHTS_FIELDS)}
+    return FutureRights(**values, raw=raw)
 
 
 def parse_many(lines: Iterable[str], parser):
@@ -181,7 +166,9 @@ def parse_query_order_row(login_id: str, raw: str) -> QueryOrderReport:
     Parse one GetOrderReport row (official 5-4-4, nFormat 1-6/9; 0-based = 官方編號-1):
     0 市場別, 1 商品別, 2 交易所別, 3 分公司, 4 IBNO, 5 帳號, 6 子帳,
     7 委託書號, 8 13碼流水號, 9 原始13碼, 10 委託狀態, 11 委託日, 12 委託時間,
-    13 歸屬日, 14 有效日, 15 商品代號, 16-21 兩腳Tandem, 22 買賣別, 23 盤別,
+    13 歸屬日, 14 有效日, 15 商品代號 (期貨為交易所契約代碼, 例如 TMFI6),
+    16 Tandem商品代號1 (單腳期貨也會填商品代號, 例如 FITM), 17 Tandem契約年月1 (yyyyMM, 例如 202609),
+    18 Tandem履約價1, 19-21 Tandem 第二腳, 22 買賣別, 23 盤別,
     24 證券委託條件, 25 委託條件, 26 委託方式, 27 委託價, 28 原始委託價,
     29 有效量, 30 原始量, 31 成交量, 32 剩餘量, 33 當沖, 34 判別T+1, 35 錯誤回報,
     36 下單來源, 37 交易單位股數, 38 預約單價格註記, 39 營業員, 40 CallPut,
@@ -196,7 +183,9 @@ def parse_query_order_row(login_id: str, raw: str) -> QueryOrderReport:
         branch=safe_get(f, 3), account=safe_get(f, 5),
         order_no=safe_get(f, 7), seq_no=safe_get(f, 8), orig_seq_no=safe_get(f, 9),
         status=safe_get(f, 10), order_date=safe_get(f, 11), order_time=safe_get(f, 12),
-        symbol=safe_get(f, 15), buy_sell=safe_get(f, 22), session=safe_get(f, 23),
+        valid_date=safe_get(f, 14), symbol=safe_get(f, 15),
+        leg1_product=safe_get(f, 16), leg1_month=safe_get(f, 17),
+        buy_sell=safe_get(f, 22), session=safe_get(f, 23),
         stock_flag=safe_get(f, 24), trade_type=safe_get(f, 25), price_type=safe_get(f, 26),
         price=safe_get(f, 27), orig_price=safe_get(f, 28),
         valid_qty=safe_get(f, 29), orig_qty=safe_get(f, 30),

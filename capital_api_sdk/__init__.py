@@ -8,6 +8,7 @@ Module map:
   tick_stream.py      incremental tick batches, ptr-gap detection/repair, DataFrame
   quote_workflows.py  interactive probe / preview helpers
   snapshot.py         read-only account snapshot + batch tools
+  taifex.py           TAIFEX index futures specs, symbol namespaces and code translation
   public_data.py      public Capital website endpoints (delayed data)
   doctor.py           environment preflight (DLL / COM registration / comtypes cache)
 """
@@ -16,6 +17,7 @@ from .models import (
     # enums
     Authority,
     Side,
+    normalize_side,
     TradeType,
     StockPrime,
     StockPeriod,
@@ -33,9 +35,13 @@ from .models import (
     STOCK_PRICE_LIMIT_DOWN,
     FUTURES_PRICE_MARKET,
     FUTURES_PRICE_RANGE_MARKET,
-    # report code tables
+    # report code tables / field name tables (attribute -> 中文)
     ORDER_STATUS_NAMES,
     QUERY_SESSION_NAMES,
+    QUERY_ORDER_FIELDS,
+    FUTURE_POSITION_FIELDS,
+    FUTURE_RIGHTS_FIELDS,
+    FUTURE_RIGHTS_TEXT_FIELDS,
     # exceptions
     CapitalApiError,
     CapitalApiNotLoaded,
@@ -139,14 +145,28 @@ from .snapshot import (
     STOCK_MARKET_TYPES,
     FUTURE_MARKET_TYPES,
 )
+from .taifex import (
+    CONTRACTS,
+    MONTH_CODES,
+    ContractSpec,
+    contract_code,
+    contract_of,
+    is_orderable,
+    point_value,
+    third_wednesday,
+    to_report_code,
+)
 
 __all__ = [
     "CapitalClient", "CapitalConfig", "EventHub",
-    "Authority", "Side", "TradeType", "StockPrime", "StockPeriod", "StockFlag", "StockPriceType",
+    "Authority", "Side", "normalize_side", "TradeType", "StockPrime", "StockPeriod", "StockFlag", "StockPriceType",
     "FuturesDayTrade", "FuturesNewClose", "FuturesReserved", "FutureRightsCoinType", "MarketType", "OrderMarket",
     "STOCK_PRICE_REFERENCE", "STOCK_PRICE_LIMIT_UP", "STOCK_PRICE_LIMIT_DOWN",
     "FUTURES_PRICE_MARKET", "FUTURES_PRICE_RANGE_MARKET",
     "ORDER_STATUS_NAMES", "QUERY_SESSION_NAMES",
+    "QUERY_ORDER_FIELDS", "FUTURE_POSITION_FIELDS", "FUTURE_RIGHTS_FIELDS", "FUTURE_RIGHTS_TEXT_FIELDS",
+    "CONTRACTS", "MONTH_CODES", "ContractSpec", "contract_code", "contract_of", "is_orderable", "point_value",
+    "third_wednesday", "to_report_code",
     "CapitalApiError", "CapitalApiNotLoaded", "CapitalApiLiveOrderDisabled", "CapitalApiCallError",
     "ApiResult", "Account", "OrderEvent", "QueryOrderReport", "QueryFillReport",
     "StockPosition", "FuturePosition", "FutureRights", "CapitalPayBalance",

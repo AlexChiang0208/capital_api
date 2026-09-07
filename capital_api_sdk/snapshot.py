@@ -2,7 +2,8 @@
 
 把所有「查詢類」API(get_*)彙整成方便轉 DataFrame 的 dict,不含任何下單/改單/刪單。
 
-效能提醒:時間幾乎都花在每個查詢的 `client.pump(wait_sec)` 固定等待上(跟資料量無關)。
+效能提醒:等待以官方結束標記為準(查詢類為「##/查無資料」列、回報為 OnComplete),
+收到就提前返回,通常遠快於 wait_sec;wait_sec 只是收不到標記時的等待上限。
 所以本模組:
   1. 拆成獨立小函式(帳戶/餘額/現貨庫存/期貨未平倉/期貨權益/掛單),可單獨呼叫。
   2. `fetch_account_snapshot(..., include=...)` 只查有選到的區塊,沒選到的不查不等待。
@@ -16,7 +17,7 @@ import warnings
 from dataclasses import asdict
 from typing import Any, Callable, Iterable
 
-from .models import FutureRightsCoinType
+from .models import FutureRightsCoinType, is_report_end_row
 
 # OnNewData 委託回報的市場別(field[1])分類:證券 vs 期貨(官方 4-3-g 定義)。
 # TS 證券 / TA 盤後 / TL 零股 / TP 興櫃 / TC 盤中零股 / OS 複委託
@@ -51,7 +52,7 @@ _SECTION_ALIASES: dict[str, tuple[str, ...]] = {
 
 def is_real_row(raw: str) -> bool:
     """過濾掉 SKCOM 的結束標記列(## 開頭)與「查無資料」列。"""
-    return not (raw.startswith("##") or "查無資料" in raw)
+    return not is_report_end_row(raw)
 
 
 def _rows_to_dict(rows: list[dict], key_fn: Callable[[dict], Any]) -> dict:
@@ -185,8 +186,11 @@ def fetch_open_orders(client, *, market: str = "all", reply_pump_sec: float = 3)
     已依成交(D)/取消(C)回報沖銷;不論 market 為何都要等回報,拆 market 只是過濾輸出。
     若要不依賴連線時間的完整掛單,改用 fetch_order_reports(n_format=3 可消單,
     盤中零股也查得到)。
+
+    等待以官方 OnComplete(當日回報回補完成)為準,通常在 login 階段就已收到,
+    這裡幾乎不等;收不到才退回固定等 reply_pump_sec。
     """
-    client.pump(reply_pump_sec)
+    client.wait_reply_complete(reply_pump_sec)
     orders = client.get_open_orders()
     m = str(market).strip().lower()
     if m in ("stock", "spot", "現貨"):
@@ -214,7 +218,8 @@ def _query_order_to_row(r) -> dict:
         "price": r.price, "orig_qty": r.orig_qty, "filled_qty": r.filled_qty,
         "remaining_qty": r.remaining_qty, "avg_fill_price": r.avg_fill_price,
         "order_no": r.order_no, "seq_no": r.seq_no,
-        "order_date": r.order_date, "order_time": r.order_time, "raw": r.raw,
+        "order_date": r.order_date, "order_time": r.order_time, "valid_date": r.valid_date,
+        "leg1_product": r.leg1_product, "leg1_month": r.leg1_month, "raw": r.raw,
     }
 
 
@@ -333,7 +338,8 @@ def fetch_account_snapshot(
             snapshot["future_rights"] = _err(exc)
     if "open_orders" in sections:
         try:
-            client.pump(reply_pump_sec)
+            # OnComplete 已到就不再固定等待(見 fetch_open_orders 說明)。
+            client.wait_reply_complete(reply_pump_sec)
             (snapshot["open_orders"], snapshot["stock_open_orders"],
              snapshot["future_open_orders"]) = _split_order_tables(client.get_open_orders())
         except Exception as exc:

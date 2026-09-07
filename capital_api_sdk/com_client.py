@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .models import (
     STOCK_PRICE_LIMIT_DOWN,
@@ -43,6 +43,7 @@ from .models import (
     StockPriceType,
     StockPrime,
     TradeType,
+    is_report_end_row,
 )
 from .parsers import (
     parse_account,
@@ -165,16 +166,35 @@ class EventHub:
     _tick_dropped: int = field(default=0, repr=False)
     _quote_dropped: int = field(default=0, repr=False)
     _best5_dropped: int = field(default=0, repr=False)
+    # tick / best5 rows that arrived before the first quote event of their (market_no, stock_index)
+    # key and therefore still lack a symbol. add_quote names exactly these rows instead of rescanning
+    # every cached row on every quote event (that scan was O(cached ticks) per event: ~0.5s each
+    # with a 500k tick cache, i.e. minutes of stall after a few tick backfills).
+    _unnamed_ticks: dict[tuple[int, int], list[QuoteTick]] = field(default_factory=dict, repr=False)
+    _unnamed_best5: dict[tuple[int, int], list[QuoteBest5]] = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     @staticmethod
     def _trim_locked(rows: list, cap: int | None) -> int:
-        """Drop the oldest rows beyond cap; returns how many were dropped."""
+        """Drop the oldest rows once the list exceeds cap; returns how many were dropped.
+
+        Trims in chunks (down to 90% of cap) rather than one row per append: deleting from
+        the front of a Python list is O(n), so trimming a single row per event at the 1M cap
+        turned every appended tick into a full memmove (a day's backfill then cost minutes).
+        """
         if cap is None or len(rows) <= int(cap):
             return 0
-        drop = len(rows) - int(cap)
+        drop = len(rows) - (int(cap) - int(cap) // 10)
         del rows[:drop]
         return drop
+
+    @staticmethod
+    def _remember_unnamed_locked(store: dict, key: tuple[int, int], row) -> None:
+        """Park a symbol-less tick/best5 until the quote event for its key names it (bounded)."""
+        rows = store.setdefault(key, [])
+        rows.append(row)
+        if len(rows) > 1000:
+            del rows[:-1000]
 
     def add_account(self, login_id: str, raw: str) -> None:
         account = parse_account(login_id, raw)
@@ -311,11 +331,11 @@ class EventHub:
 
     def _backfill_quote_symbol_locked(self, symbol: str, market_no: int, stock_index: int) -> None:
         key = (int(market_no), int(stock_index))
-        for tick in self.tick_events:
-            if not tick.symbol and (int(tick.market_no), int(tick.stock_index)) == key:
+        for tick in self._unnamed_ticks.pop(key, ()):
+            if not tick.symbol:
                 tick.symbol = symbol
-        for best5 in self.best5_events:
-            if not best5.symbol and (int(best5.market_no), int(best5.stock_index)) == key:
+        for best5 in self._unnamed_best5.pop(key, ()):
+            if not best5.symbol:
                 best5.symbol = symbol
 
     def get_latest_quotes(self) -> dict[str, QuoteSnapshot]:
@@ -328,9 +348,12 @@ class EventHub:
 
     def add_tick(self, tick: QuoteTick) -> None:
         with self._lock:
-            quote = self.quotes_by_key.get((tick.market_no, tick.stock_index))
+            key = (int(tick.market_no), int(tick.stock_index))
+            quote = self.quotes_by_key.get(key)
             if quote and not tick.symbol:
                 tick.symbol = quote.symbol
+            elif not tick.symbol:
+                self._remember_unnamed_locked(self._unnamed_ticks, key, tick)
             self.tick_events.append(tick)
             self._tick_dropped += self._trim_locked(self.tick_events, self.max_tick_events)
 
@@ -405,9 +428,12 @@ class EventHub:
 
     def add_best5(self, best5: QuoteBest5) -> None:
         with self._lock:
-            quote = self.quotes_by_key.get((best5.market_no, best5.stock_index))
+            key = (int(best5.market_no), int(best5.stock_index))
+            quote = self.quotes_by_key.get(key)
             if quote and not best5.symbol:
                 best5.symbol = quote.symbol
+            elif not best5.symbol:
+                self._remember_unnamed_locked(self._unnamed_best5, key, best5)
             self.best5_events.append(best5)
             self._best5_dropped += self._trim_locked(self.best5_events, self.max_best5_events)
             self.best5_by_key[(best5.market_no, best5.stock_index)] = best5
@@ -462,6 +488,8 @@ class EventHub:
             self.tick_events.clear()
             self.best5_events.clear()
             self.best5_by_key.clear()
+            self._unnamed_ticks.clear()
+            self._unnamed_best5.clear()
             self.kline_records.clear()
             self.quote_errors.clear()
             self._tick_dropped = 0
@@ -654,6 +682,10 @@ _QUOTE_CONNECTION_STATES = {
 MAX_TICK_PAGE_NO = 49
 # Official manual: GetOrderReport / GetFulfillReport queries must be >= 5s apart
 REPORT_QUERY_INTERVAL_SEC = 5.5
+# Event-answered account queries (GetOpenInterestGW / GetFutureRights / GetRealBalanceReport) re-issued
+# within ~5s of the same query are rejected with 1019 SK_ERROR_QUERY_IN_PROCESSING and never answer
+# (verified live 2026-09-03); the client waits this long between same-type calls.
+ACCOUNT_QUERY_INTERVAL_SEC = 5.5
 
 
 class CapitalClient:
@@ -679,6 +711,7 @@ class CapitalClient:
         self.hub = EventHub()
         self._loaded = False
         self._last_report_query_at: float | None = None
+        self._last_account_query_at: dict[str, float] = {}
         self._event_handlers: list[Any] = []
         self._comtypes = None
         self._pythoncom = None
@@ -853,22 +886,44 @@ class CapitalClient:
                 cert_code = self.sk_order.ReadCertByID(cert_id)
                 self._result("ReadCertByID", cert_code, raw=cert_id)
         self.sk_order.GetUserAccount()
-        self.pump(wait_sec)
+        # OnAccount rows arrive in one quick burst and have no terminator, so
+        # "at least one row and quiet" is the earliest safe stop; otherwise
+        # fall back to the old fixed wait.
+        self._pump_until_stable(lambda: len(self.hub.get_accounts(self.config.user_id)), wait_sec)
         return result
 
     def connect_reply(self, wait_sec: float = 1.0) -> ApiResult:
+        """Connect the reply (回報) server and wait for the replay to finish.
+
+        OnComplete is the official "today's reports fully replayed" event, so
+        waiting for it replaces the old fixed sleep; when it never shows up the
+        call still waits at most wait_sec like before.
+        """
         self._ensure_loaded()
         if not hasattr(self.sk_reply, "SKReplyLib_ConnectByID"):
             return self._result("SKReplyLib_ConnectByID", -999, broker_message="method not available")
         code = self.sk_reply.SKReplyLib_ConnectByID(self.config.user_id)
         result = self._result("SKReplyLib_ConnectByID", code)
-        self.pump(wait_sec)
+        self.wait_reply_complete(wait_sec)
         return result
+
+    def wait_reply_complete(self, timeout_sec: float = 2.0, settle_sec: float = 0.2) -> bool:
+        """Pump until OnComplete(當日回報回補完成) arrived for this login.
+
+        Returns True when the marker is in; then pumps settle_sec more so reports
+        queued after the marker are dispatched too. OnComplete fires once per
+        reply connection, so later calls in the same session return fast; a
+        missing marker falls back to pumping the full timeout_sec.
+        """
+        done = self._pump_until(timeout_sec, lambda: self.config.user_id in self.hub.complete_logins)
+        if done and settle_sec > 0:
+            self.pump(settle_sec)
+        return done
 
     def get_accounts(self, wait_sec: float = 1.0):
         self._ensure_loaded()
         self.sk_order.GetUserAccount()
-        self.pump(wait_sec)
+        self._pump_until_stable(lambda: len(self.hub.get_accounts(self.config.user_id)), wait_sec)
         return self.hub.get_accounts(self.config.user_id)
 
     def _default_account(self, prefix: str | None = None) -> str:
@@ -916,6 +971,20 @@ class CapitalClient:
         if wait_sec > 0:
             self.wait_quote_connected(wait_sec)
         return result
+
+    def reconnect_quote(self, *, wait_sec: float = 8.0) -> bool:
+        """LeaveMonitor then EnterMonitor: release this process's quote connection and take a fresh one.
+
+        The usual cure for 3030 SK_SUBJECT_NO_QUOTE_SUBSCRIBE: an account may hold only two quote
+        connections and zombie clients (re-run notebook cells) eat them. Returns True when the new
+        session reports STOCKS_READY; False means the quota is still exhausted elsewhere.
+        """
+        try:
+            self.disconnect_quote()
+        except Exception as exc:
+            self.hub.add_quote_error(f"SKQuoteLib_LeaveMonitor failed: {exc}")
+        self.connect_quote(wait_sec=wait_sec)
+        return self.is_quote_ready()
 
     def disconnect_quote(self, *, wait_sec: float = 0.5) -> ApiResult:
         self._ensure_loaded()
@@ -990,11 +1059,22 @@ class CapitalClient:
 
     def request_stock_list(self, market_no: int, *, wait_sec: float = 2.0, clear: bool = True) -> list[StockListItem]:
         self._ensure_loaded()
+        self.pump(0.05)  # flush queued rows of an earlier request before (not into) the new batch
         if clear:
             self.hub.clear_stock_list(int(market_no))
+
+        def end_marker_count() -> int:
+            return sum(1 for item in self.hub.get_stock_list(int(market_no)) if item.symbol.strip() == "##")
+
+        # OnNotifyStockList closes the batch with a "##" row; waiting for a NEW
+        # one (count above the pre-request baseline, so clear=False cannot match
+        # a stale marker) instead of a fixed sleep stops a long list being
+        # truncated silently. A failed request gets no events, so don't wait.
+        baseline = end_marker_count()
         code = self.sk_quote.SKQuoteLib_RequestStockList(int(market_no))
-        self._result("SKQuoteLib_RequestStockList", code, raw=market_no)
-        self.pump(wait_sec)
+        result = self._result("SKQuoteLib_RequestStockList", code, raw=market_no)
+        if result.ok:
+            self._pump_until(wait_sec, lambda: end_marker_count() > baseline)
         return self.hub.get_stock_list(int(market_no))
 
     def subscribe_quotes(
@@ -1248,38 +1328,43 @@ class CapitalClient:
     def get_stock_positions(self, account: str | None = None, wait_sec: float = 2.0) -> list[StockPosition]:
         self._ensure_loaded()
         acc = account or self._default_account("TS")
-        self.hub.clear_stock_positions()
-        code = self.sk_order.GetRealBalanceReport(self.config.user_id, acc)
-        self._result("GetRealBalanceReport", code, raw=acc)
-        self.pump(wait_sec)
-        return parse_many(self.hub.raw_stock_positions, parse_stock_position_raw)
+        rows = self._account_query(
+            "GetRealBalanceReport", lambda: self.sk_order.GetRealBalanceReport(self.config.user_id, acc),
+            self.hub.raw_stock_positions, self.hub.clear_stock_positions, wait_sec, raw=acc,
+        )
+        return parse_many(rows, parse_stock_position_raw)
 
-    def _sync_report_query(self, method_name: str, account: str | None, n_format: int, *, kind: str, retries: int = 1):
+    def _sync_report_query(self, method_name: str, account: str | None, n_format: int, *, kind: str, retries: int = 3):
         """
         Run a blocking SKOrderLib report query (GetOrderReport / GetFulfillReport).
 
-        The official manual requires >= 5 seconds between report queries. The
-        interval must be spent PUMPING COM messages (not sleeping): without
-        pumping, the component never marks the previous query finished and keeps
-        answering M999. Retries once when the server still answers M999.
+        The official manual requires >= 5 seconds between report queries, and the
+        component answers M999 ("有查詢尚未結束或前次查詢後尚未等候五秒") when either
+        the interval is too short or it has not yet processed the completion of the
+        previous query / a just-sent order or cancel. Both conditions clear only while
+        COM messages are being PUMPED (verified live 2026-09-04: a raw query after a
+        30s idle without pumping gets M999, the same query after a 0.2s pump succeeds),
+        so this pumps before the first call, waits the official interval before every
+        retry, and raises CapitalApiError only after `retries` extra attempts.
+        The 5-second rule is enforced inside the component, not per login on the server:
+        another process querying at the same time does not trigger it (verified live).
         """
         self._ensure_loaded()
         acc = account or self._default_account(None)
         method = getattr(self.sk_order, method_name)
-        for attempt in range(int(retries) + 1):
-            wait = self._report_query_wait_sec()
-            if wait > 0:
-                self.pump(wait)
-            else:
-                self.pump(0.1)
+        last_error: Exception | None = None
+        for _attempt in range(int(retries) + 1):
+            self.pump(max(self._report_query_wait_sec(), 0.3))
             self._last_report_query_at = time.monotonic()
             raw = str(method(self.config.user_id, acc, int(n_format)))
             try:
                 return parse_report_query_result(self.config.user_id, raw, kind=kind)
-            except RuntimeError:
-                if attempt >= retries:
-                    raise
-        return []
+            except RuntimeError as exc:
+                last_error = exc
+        raise CapitalApiError(
+            f"{method_name} still rejected after {retries} retries ({last_error}); the component is still "
+            "processing a previous query or order - wait a few seconds and run the query again"
+        )
 
     def _report_query_wait_sec(self) -> float:
         if self._last_report_query_at is None:
@@ -1316,23 +1401,134 @@ class CapitalClient:
         """
         return self._sync_report_query("GetFulfillReport", account, n_format, kind="fill")
 
+    def _pump_until(self, wait_sec: float, done: "Callable[[], bool]", step: float = 0.05) -> bool:
+        """Pump COM messages until done() is true, or wait_sec elapses.
+
+        SKCOM answers queries asynchronously and closes each batch with an
+        explicit terminator row. Waiting for that official marker instead of
+        blindly sleeping wait_sec is both faster (a typical query finishes in
+        ~0.1s) and safer: a fixed wait silently truncates a batch that takes
+        longer, while this only returns once the end marker really arrived.
+        Falls back to exactly the old fixed wait when the marker never shows up;
+        returns whether done() was reached.
+        """
+        deadline = time.monotonic() + max(0.0, float(wait_sec))
+        while time.monotonic() < deadline:
+            self.pump(step)
+            if done():
+                return True
+        return done()
+
+    def _pump_until_stable(
+        self,
+        count: "Callable[[], int]",
+        wait_sec: float,
+        *,
+        idle_sec: float = 0.5,
+        step: float = 0.05,
+    ) -> None:
+        """Pump until count() is positive and stopped changing for idle_sec.
+
+        For replies WITHOUT a terminator row (e.g. OnAccount): rows arrive in one
+        burst, so "some rows and then quiet" is the earliest safe stop. Waits the
+        full wait_sec when nothing arrives at all (old fixed-wait behaviour).
+        """
+        deadline = time.monotonic() + max(0.0, float(wait_sec))
+        last = count()
+        last_change = time.monotonic()
+        while time.monotonic() < deadline:
+            if last > 0 and time.monotonic() - last_change >= idle_sec:
+                return
+            self.pump(step)
+            current = count()
+            if current != last:
+                last, last_change = current, time.monotonic()
+
+    def _pump_until_report_end(self, rows: list[str], wait_sec: float, step: float = 0.05) -> None:
+        """Wait for an account query to close: "##..." row, or "001,查無資料" when empty.
+
+        An empty result can send BOTH rows (查無資料 first, "##" trailing), so after
+        the first marker keep draining until the list is quiet — otherwise the
+        trailing "##" stays queued and would instantly (and wrongly) satisfy the
+        NEXT query's end check, truncating that query's data.
+        """
+        if self._pump_until(wait_sec, lambda: any(is_report_end_row(row) for row in rows), step):
+            self._pump_until_stable(lambda: len(rows), 1.0, idle_sec=0.3, step=step)
+
+    def _begin_account_query(self, clear: "Callable[[], None]") -> None:
+        """Flush queued leftover events from a previous query, THEN clear the cache.
+
+        Any still-undispatched terminator row from an earlier query would land in
+        the fresh batch and end it prematurely; dispatching it before clear()
+        makes it get wiped instead.
+        """
+        self.pump(0.05)
+        clear()
+
+    def _account_query(
+        self,
+        method: str,
+        call: "Callable[[], Any]",
+        rows: list[str],
+        clear: "Callable[[], None]",
+        wait_sec: float,
+        *,
+        raw: Any = None,
+    ) -> list[str]:
+        """Run an event-answered account query and return its data rows once the end marker arrived.
+
+        SKCOM closes every answer with a marker row ("##..." or "001,查無資料,帳號"). The same query
+        re-issued within ~5 s is rejected (1019 SK_ERROR_QUERY_IN_PROCESSING) and a rejected or
+        timed-out query leaves NO marker, so an empty list would be indistinguishable from "no data"
+        (a position guard would then see a flat account). This therefore waits out the official
+        interval since the previous call of the same method, and if the marker still does not
+        arrive it retries once and then raises CapitalApiError instead of returning [].
+        """
+        result = None
+        for attempt in (1, 2):
+            elapsed = time.monotonic() - self._last_account_query_at.get(method, -ACCOUNT_QUERY_INTERVAL_SEC)
+            if elapsed < ACCOUNT_QUERY_INTERVAL_SEC:
+                self.pump(ACCOUNT_QUERY_INTERVAL_SEC - elapsed)
+            self._begin_account_query(clear)
+            self._last_account_query_at[method] = time.monotonic()
+            result = self._result(method, call(), raw=raw)
+            if result.ok:
+                self._pump_until_report_end(rows, wait_sec)
+                if any(is_report_end_row(row) for row in rows):
+                    return [row for row in rows if not is_report_end_row(row)]
+        raise CapitalApiError(
+            f"{method} did not answer after a retry (code={result.code} {result.message}; "
+            f"no end marker within {wait_sec}s) - do not treat this as an empty account"
+        )
+
     def get_future_positions(self, account: str | None = None, n_format: int = 1, wait_sec: float = 2.0) -> list[FuturePosition]:
+        """Futures open interest (GetOpenInterestGW nFormat=1), see models.FUTURE_POSITION_FIELDS.
+
+        Waits the official interval between same-type queries and raises CapitalApiError when the
+        query does not answer, so [] really means "no open position".
+        """
         self._ensure_loaded()
         acc = account or self._default_account("TF")
-        self.hub.clear_future_positions()
-        code = self.sk_order.GetOpenInterestGW(self.config.user_id, acc, int(n_format))
-        self._result("GetOpenInterestGW", code, raw={"account": acc, "format": n_format})
-        self.pump(wait_sec)
-        return parse_many(self.hub.raw_future_positions, parse_future_position_raw)
+        rows = self._account_query(
+            "GetOpenInterestGW", lambda: self.sk_order.GetOpenInterestGW(self.config.user_id, acc, int(n_format)),
+            self.hub.raw_future_positions, self.hub.clear_future_positions, wait_sec,
+            raw={"account": acc, "format": n_format},
+        )
+        return parse_many(rows, parse_future_position_raw)
 
     def get_future_rights(self, account: str | None = None, coin_type: FutureRightsCoinType | int = FutureRightsCoinType.TWD, wait_sec: float = 2.0) -> list[FutureRights]:
+        """Futures rights / margins (GetFutureRights), all 41 fields, see models.FUTURE_RIGHTS_FIELDS.
+
+        Same interval handling and error semantics as get_future_positions.
+        """
         self._ensure_loaded()
         acc = account or self._default_account("TF")
-        self.hub.clear_future_rights()
-        code = self.sk_order.GetFutureRights(self.config.user_id, acc, int(coin_type))
-        self._result("GetFutureRights", code, raw={"account": acc, "coin_type": int(coin_type)})
-        self.pump(wait_sec)
-        return parse_many(self.hub.raw_future_rights, parse_future_rights_raw)
+        rows = self._account_query(
+            "GetFutureRights", lambda: self.sk_order.GetFutureRights(self.config.user_id, acc, int(coin_type)),
+            self.hub.raw_future_rights, self.hub.clear_future_rights, wait_sec,
+            raw={"account": acc, "coin_type": int(coin_type)},
+        )
+        return parse_many(rows, parse_future_rights_raw)
 
     def get_capital_pay_balance(self) -> CapitalPayBalance:
         self._ensure_loaded()
