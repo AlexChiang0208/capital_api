@@ -21,6 +21,7 @@ from .models import (
     CapitalApiNotLoaded,
     CapitalPayBalance,
     FuturePosition,
+    FuturePositionSides,
     FutureRights,
     FutureRightsCoinType,
     FuturesDayTrade,
@@ -48,7 +49,9 @@ from .models import (
 from .parsers import (
     parse_account,
     parse_capital_pay_balance,
+    parse_future_position_format2_raw,
     parse_future_position_raw,
+    parse_future_position_sides_raw,
     parse_future_rights_raw,
     parse_kline_record,
     parse_many,
@@ -1474,6 +1477,7 @@ class CapitalClient:
         wait_sec: float,
         *,
         raw: Any = None,
+        interval_key: str | None = None,
     ) -> list[str]:
         """Run an event-answered account query and return its data rows once the end marker arrived.
 
@@ -1483,14 +1487,18 @@ class CapitalClient:
         (a position guard would then see a flat account). This therefore waits out the official
         interval since the previous call of the same method, and if the marker still does not
         arrive it retries once and then raises CapitalApiError instead of returning [].
+        interval_key groups methods that hit the same server-side query (GetOpenInterestGW and
+        GetOpenInterestWithFormat both ask for 未平倉 and answer through OnOpenInterest), so they
+        share one interval instead of tripping the 1019 rejection on each other.
         """
+        key = interval_key or method
         result = None
         for attempt in (1, 2):
-            elapsed = time.monotonic() - self._last_account_query_at.get(method, -ACCOUNT_QUERY_INTERVAL_SEC)
+            elapsed = time.monotonic() - self._last_account_query_at.get(key, -ACCOUNT_QUERY_INTERVAL_SEC)
             if elapsed < ACCOUNT_QUERY_INTERVAL_SEC:
                 self.pump(ACCOUNT_QUERY_INTERVAL_SEC - elapsed)
             self._begin_account_query(clear)
-            self._last_account_query_at[method] = time.monotonic()
+            self._last_account_query_at[key] = time.monotonic()
             result = self._result(method, call(), raw=raw)
             if result.ok:
                 self._pump_until_report_end(rows, wait_sec)
@@ -1512,9 +1520,40 @@ class CapitalClient:
         rows = self._account_query(
             "GetOpenInterestGW", lambda: self.sk_order.GetOpenInterestGW(self.config.user_id, acc, int(n_format)),
             self.hub.raw_future_positions, self.hub.clear_future_positions, wait_sec,
-            raw={"account": acc, "format": n_format},
+            raw={"account": acc, "format": n_format}, interval_key="OpenInterest",
         )
         return parse_many(rows, parse_future_position_raw)
+
+    def get_future_positions_with_format(
+        self, account: str | None = None, n_format: int = 1, wait_sec: float = 2.0,
+    ) -> "list[FuturePositionSides] | list[FuturePosition]":
+        """Futures open interest through GetOpenInterestWithFormat (official 4-2-59), answered by OnOpenInterest.
+
+        n_format 1 完整: one row per product with the buy and sell sides side by side (口數 / 當沖 / 均價),
+                   INCLUDING 複式單 -> list[FuturePositionSides] (models.FUTURE_POSITION_SIDES_FIELDS).
+        n_format 2 格式1: same without the 均價 columns -> list[FuturePositionSides] with empty avg prices.
+        n_format 3 格式2: the GW format 1 layout plus 一點價值, 不含複式單 -> list[FuturePosition]
+                   with point_value filled (單口手續費 / 交易稅 暫不提供 since 2.13.53).
+        Shares the 5-second interval with get_future_positions (both are 未平倉 queries on the same
+        server side); same end-marker / retry / CapitalApiError semantics, so [] really means flat.
+        All three layouts verified live 2026-09-09 (5 lots 微台 long). Quirks: 完整 均價 arrive with
+        2 implied decimals (parser rescales 4719400 -> "47194.00"); 格式2 prints the QUOTE code
+        (TM2609) as symbol while the other formats print the position code (TM09).
+        """
+        self._ensure_loaded()
+        fmt = int(n_format)
+        if fmt not in (1, 2, 3):
+            raise ValueError(f"GetOpenInterestWithFormat n_format must be 1 完整 / 2 格式1 / 3 格式2, got {n_format!r}")
+        acc = account or self._default_account("TF")
+        rows = self._account_query(
+            "GetOpenInterestWithFormat",
+            lambda: self.sk_order.GetOpenInterestWithFormat(self.config.user_id, acc, fmt),
+            self.hub.raw_future_positions, self.hub.clear_future_positions, wait_sec,
+            raw={"account": acc, "format": fmt}, interval_key="OpenInterest",
+        )
+        if fmt == 3:
+            return parse_many(rows, parse_future_position_format2_raw)
+        return parse_many(rows, lambda raw: parse_future_position_sides_raw(raw, with_avg_price=(fmt == 1)))
 
     def get_future_rights(self, account: str | None = None, coin_type: FutureRightsCoinType | int = FutureRightsCoinType.TWD, wait_sec: float = 2.0) -> list[FutureRights]:
         """Futures rights / margins (GetFutureRights), all 41 fields, see models.FUTURE_RIGHTS_FIELDS.

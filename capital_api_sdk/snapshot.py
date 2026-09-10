@@ -171,6 +171,15 @@ def fetch_future_positions(client, *, account: str | None = None, wait_sec: floa
     return _fmt_positions(client.get_future_positions(account=account, wait_sec=wait_sec), "symbol")
 
 
+def fetch_future_positions_full(client, *, account: str | None = None, wait_sec: float = 3) -> dict:
+    """期貨未平倉「完整」格式(GetOpenInterestWithFormat nFormat=1,dict of dict,key=symbol)。
+
+    每個商品一列,買方 / 賣方的口數、當沖口數、成交均價並排,含複式單(GW 格式 1 不含)。
+    欄名見 FUTURE_POSITION_SIDES_FIELDS;與 fetch_future_positions 共用官方 5 秒查詢間隔。
+    """
+    return _fmt_positions(client.get_future_positions_with_format(account=account, n_format=1, wait_sec=wait_sec), "symbol")
+
+
 def fetch_future_rights(client, *, account: str | None = None,
                         coin_type: FutureRightsCoinType | int = FutureRightsCoinType.TWD,
                         wait_sec: float = 3) -> dict:
@@ -228,10 +237,12 @@ def _query_fill_to_row(r) -> dict:
     return {
         "market": r.market, "product": r.product, "exchange": r.exchange,
         "symbol": r.symbol, "buy_sell": r.buy_sell, "session": r.session,
+        "t1_session": r.t1_session, "day_trade": r.day_trade,
         "stock_flag": r.stock_flag, "price": r.price, "qty": r.qty,
         "amount": r.amount, "fee": r.fee, "tax": r.tax,
         "order_no": r.order_no, "fill_seq": r.fill_seq,
-        "fill_date": r.fill_date, "fill_time": r.fill_time, "raw": r.raw,
+        "fill_date": r.fill_date, "fill_time": r.fill_time, "trade_date": r.trade_date,
+        "order_date": r.order_date, "order_time": r.order_time, "raw": r.raw,
     }
 
 

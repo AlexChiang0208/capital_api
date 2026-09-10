@@ -120,6 +120,8 @@ ORDER_STATUS_NAMES = {
     "9": "取消中", "F": "動態退單", "F1": "動態退單-全部取消",
     "F2": "動態退單-部分成交,剩餘已取消", "F3": "動態退單-部分委託成功", "F4": "否決",
 }
+# GetOrderReport statuses that still have quantity working at the exchange (0 預約, 5 部分成交剩餘可取消, 7 委託成功).
+OPEN_ORDER_STATUSES: tuple[str, ...] = ("0", "5", "7")
 # Query-row 盤別 codes (official 5-4-4 field 24).
 QUERY_SESSION_NAMES = {
     "A": "一般", "B": "盤後", "C": "零股", "D": "拍賣", "E": "鉅額",
@@ -185,8 +187,8 @@ class QueryOrderReport:
 
     @property
     def is_open(self) -> bool:
-        """Cancellable / working states: 5 部分成交剩餘可取消, 7 委託成功, 0 預約."""
-        return self.status in ("0", "5", "7")
+        """Cancellable / working states: 5 部分成交剩餘可取消, 7 委託成功, 0 預約 (OPEN_ORDER_STATUSES)."""
+        return self.status in OPEN_ORDER_STATUSES
 
 
 # QueryOrderReport attribute -> 中文 (official 5-4-4 names; parentheses = wording on the 策略王 委回 screen).
@@ -212,8 +214,11 @@ QUERY_ORDER_FIELDS: dict[str, str] = {
 class QueryFillReport:
     """One GetFulfillReport row (official 5-4-5, nFormat 1/5).
 
-    fee 為預估手續費(證券千分之1.425), tax 為預估交易稅(千分之1或3);
-    session/stock_flag/trade_type 代碼同 QueryOrderReport。
+    fee 為預估手續費(證券千分之1.425), tax 為預估交易稅(千分之1或3), 官方註明僅證券與
+    複委託有值, 期貨列回 "0.00" / "0" (verified live 2026-09-09); session/stock_flag/trade_type
+    代碼同 QueryOrderReport。
+    夜盤成交的 fill_date 是實際成交日, trade_date(交易歸屬日) 才是它結算到的交易日,
+    t1_session 為 B 即 T+1 盤 (夜盤)。
     """
     login_id: str = ""
     market: str = ""
@@ -225,6 +230,7 @@ class QueryFillReport:
     fill_seq: str = ""         # 成交序號
     fill_date: str = ""
     fill_time: str = ""
+    trade_date: str = ""       # 交易歸屬日 (夜盤成交歸屬次一交易日)
     symbol: str = ""
     buy_sell: str = ""
     session: str = ""
@@ -232,6 +238,8 @@ class QueryFillReport:
     trade_type: str = ""
     price: str = ""            # 成交價
     qty: str = ""              # 成交量
+    day_trade: str = ""        # Y 當沖 / N 新倉 / O 平倉 / A 自動
+    t1_session: str = ""       # A T盤 / B T+1盤
     price_type: str = ""
     agent: str = ""
     sale_no: str = ""
@@ -244,6 +252,22 @@ class QueryFillReport:
     fill_time_ms: str = ""     # hhmmssfff
     fields: list[str] = field(default_factory=list)
     raw: str = ""
+
+
+# QueryFillReport attribute -> 中文 (official 5-4-5 names; parentheses = wording on the 策略王 成回 screen).
+QUERY_FILL_FIELDS: dict[str, str] = {
+    "market": "市場別", "product": "商品別", "exchange": "交易所別", "branch": "分公司代號", "account": "交易帳號",
+    "order_no": "委託書號", "fill_seq": "成交序號", "fill_date": "成交日期", "fill_time": "成交時間",
+    "fill_time_ms": "成交時間(hhmmssfff)", "trade_date": "交易歸屬日", "symbol": "商品代號(交易所契約代碼)",
+    "buy_sell": "買賣別(B/S)", "session": "盤別", "t1_session": "判別T+1盤(A T盤/B T+1盤)",
+    "stock_flag": "國內證券委託條件", "trade_type": "委託條件(0 ROD/1 GTC/3 IOC/4 FOK)",
+    "price_type": "委託方式(1 市價/2 限價/3 範圍市價)",
+    "price": "成交價", "qty": "成交量", "amount": "成交價金",
+    "day_trade": "當沖註記(Y 當沖/N 新倉/O 平倉/A 自動)",
+    "fee": "預估手續費(期貨回 0, 僅證券與複委託有值)", "tax": "預估交易稅(期貨回 0, 僅證券與複委託有值)",
+    "order_date": "委託日期", "order_time": "委託時間", "unit_shares": "交易單位股數",
+    "sale_no": "營業員", "agent": "下單來源別",
+}
 
 
 @dataclass(slots=True)
@@ -283,6 +307,7 @@ FUTURE_POSITION_FIELDS: dict[str, str] = {
     "open_qty": "未平倉(含當沖)",
     "day_trade_qty": "當沖未平倉",
     "avg_price": "成交均價(平均成本)",
+    "point_value": "一點價值(僅 WithFormat 格式2)",
     "fee": "單口手續費",
     "tax": "交易稅",
     "login_id": "LOGIN_ID",
@@ -291,15 +316,55 @@ FUTURE_POSITION_FIELDS: dict[str, str] = {
 
 @dataclass(slots=True)
 class FuturePosition:
-    """One GetOpenInterestGW (nFormat=1) row; field meanings in FUTURE_POSITION_FIELDS."""
+    """One GetOpenInterestGW (nFormat=1) row, or one GetOpenInterestWithFormat nFormat=3 (格式2) row,
+    which is the same layout plus 一點價值 (point_value); field meanings in FUTURE_POSITION_FIELDS."""
     market_type: str = ""
     symbol: str = ""
     buy_sell: str = ""
     open_qty: str = ""
     day_trade_qty: str = ""
     avg_price: str = ""
+    point_value: str = ""      # only filled by WithFormat 格式2 (GW format 1 has no such column)
     fee: str = ""
     tax: str = ""
+    account_no: str = ""
+    login_id: str = ""
+    raw: str = ""
+
+
+# GetOpenInterestWithFormat nFormat=1 完整 / 2 格式1 rows (official 4-2-d / 4-2-x): one row per product with
+# the buy and sell sides side by side, INCLUDING 複式單 (which the GW format 1 query leaves out).
+# 完整 (10 fields): 市場別, 帳號, 商品, 買方未平倉, 買方當沖未平倉, 買方成交均價, 賣方未平倉, 賣方當沖未平倉,
+# 賣方成交均價, LOGIN_ID. 格式1 (8 fields) is the same without the two 均價 columns. Verified live 2026-09-09:
+# the 均價 columns arrive with 2 implied decimals (4719400); the parser rescales them to "47194.00".
+# 格式2 (nFormat=3) reuses FuturePosition (+ point_value) and prints the QUOTE code (TM2609) as symbol.
+FUTURE_POSITION_SIDES_FIELDS: dict[str, str] = {
+    "market_type": "市場別",
+    "account_no": "帳號",
+    "symbol": "商品(庫存表代碼)",
+    "buy_qty": "買方未平倉",
+    "buy_day_trade_qty": "買方當沖未平倉",
+    "buy_avg_price": "買方成交均價",
+    "sell_qty": "賣方未平倉",
+    "sell_day_trade_qty": "賣方當沖未平倉",
+    "sell_avg_price": "賣方成交均價",
+    "login_id": "LOGIN_ID",
+}
+
+
+@dataclass(slots=True)
+class FuturePositionSides:
+    """One GetOpenInterestWithFormat row (nFormat 1 完整 / 2 格式1); field meanings in FUTURE_POSITION_SIDES_FIELDS.
+
+    格式1 rows carry no 均價, so buy_avg_price / sell_avg_price stay ""."""
+    market_type: str = ""
+    symbol: str = ""
+    buy_qty: str = ""
+    buy_day_trade_qty: str = ""
+    buy_avg_price: str = ""
+    sell_qty: str = ""
+    sell_day_trade_qty: str = ""
+    sell_avg_price: str = ""
     account_no: str = ""
     login_id: str = ""
     raw: str = ""

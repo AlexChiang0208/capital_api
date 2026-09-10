@@ -108,6 +108,38 @@ def third_wednesday(year: int, month: int) -> date:
     return first.replace(day=1 + (2 - first.weekday()) % 7 + 14)
 
 
+def to_quote_code(symbol: str, today: date | None = None) -> str | None:
+    """Position or exchange code -> quote code: TM09 -> TM2609, TMFI6 -> TM2609, MXFI6 -> MTX09.
+
+    Quote codes (including near-month continuous TX00 / TM0000) pass through unchanged; anything
+    unrecognised returns None. Needed to price a position row (GetOpenInterestGW prints TM09) with
+    a live quote (RequestStocks wants TM2609). Year rules: a two-digit month (TM09) belongs to this
+    year until its settlement day has passed, then to next year (same rule as to_report_code); an
+    exchange year digit (TMFI6 -> 6) is resolved inside the current decade, rolling forward when it
+    would land more than a year in the past (contracts never trade that far back).
+    """
+    text = str(symbol).strip().upper()
+    found = contract_of(text)
+    if found is None:
+        return None
+    family, spec = found
+    if re.fullmatch(spec.quote_pattern, text):
+        return text
+    today = today or date.today()
+    if re.fullmatch(spec.report_pattern, text):
+        month = MONTH_CODES.index(text[-2]) + 1
+        year = today.year - today.year % 10 + int(text[-1])
+        if year < today.year - 1:
+            year += 10
+    else:                                     # position code with MM only (微台 TM09)
+        month = int(text[len(family):])
+        expired = today.month > month or (today.month == month and today > third_wednesday(today.year, month))
+        year = today.year + 1 if expired else today.year
+    if family == "TM":
+        return f"TM{year % 100:02d}{month:02d}"
+    return f"{family}{month:02d}"
+
+
 def to_report_code(symbol: str, today: date | None = None) -> str | None:
     """Quote or position code -> exchange code: MTX09 -> MXFI6, TM2609 -> TMFI6, TM09 -> TMFI6.
 

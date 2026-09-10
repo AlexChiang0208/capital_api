@@ -9,6 +9,7 @@ from .models import (
     Account,
     CapitalPayBalance,
     FuturePosition,
+    FuturePositionSides,
     FutureRights,
     KLineRecord,
     OrderEvent,
@@ -150,6 +151,77 @@ def parse_future_position_raw(raw: str) -> FuturePosition:
     )
 
 
+def parse_future_position_format2_raw(raw: str) -> FuturePosition:
+    """
+    Parse one OnOpenInterest row from GetOpenInterestWithFormat nFormat=3 (格式2, official
+    manual, 0-based): 0 市場別, 1 帳號, 2 商品, 3 買賣別, 4 未平倉部位, 5 當沖未平倉部位,
+    6 平均成本, 7 一點價值, 8 單口手續費, 9 交易稅 (8/9 暫不提供 since 2.13.53),
+    10 LOGIN_ID. Same as the GW format 1 row with 一點價值 inserted at 7.
+    Verified live 2026-09-09: "TF,<acct>,TM2609,B,5,0,47194.0000,10,,,<login>" - NOTE the symbol is
+    the QUOTE code (TM2609), unlike the GW / 完整 / 格式1 rows which print the position code (TM09).
+    """
+    f = raw.split(',')
+    return FuturePosition(
+        market_type=safe_get(f, 0),
+        account_no=safe_get(f, 1),
+        symbol=safe_get(f, 2),
+        buy_sell=safe_get(f, 3),
+        open_qty=safe_get(f, 4),
+        day_trade_qty=safe_get(f, 5),
+        avg_price=safe_get(f, 6),
+        point_value=safe_get(f, 7),
+        fee=safe_get(f, 8),
+        tax=safe_get(f, 9),
+        login_id=safe_get(f, 10),
+        raw=raw,
+    )
+
+
+def scale_implied_decimals(text: str, places: int) -> str:
+    """"4719400" with 2 implied decimals -> "47194.00". Values that already contain a point, are empty or are
+    not a plain integer come back unchanged (the component prints some prices with the point, some without)."""
+    value = (text or "").strip()
+    if not value or "." in value or not value.lstrip("+-").isdigit():
+        return value
+    sign = "-" if value.startswith("-") else ""
+    digits = value.lstrip("+-").rjust(places + 1, "0")
+    return f"{sign}{digits[:-places]}.{digits[-places:]}"
+
+
+def parse_future_position_sides_raw(raw: str, *, with_avg_price: bool = True) -> FuturePositionSides:
+    """
+    Parse one OnOpenInterest row from GetOpenInterestWithFormat nFormat=1 完整 (with_avg_price=True,
+    0-based): 0 市場別, 1 帳號, 2 商品, 3 買方未平倉, 4 買方當沖未平倉, 5 買方成交均價,
+    6 賣方未平倉, 7 賣方當沖未平倉, 8 賣方成交均價, 9 LOGIN_ID; or nFormat=2 格式1
+    (with_avg_price=False): 0-4 as above, 5 賣方未平倉, 6 賣方當沖未平倉, 7 LOGIN_ID.
+    Verified live 2026-09-09: "TF,<acct>,TM09,5,0,4719400,0,0,0,<login>" - the 均價 columns carry
+    2 IMPLIED decimals (4719400 = 47194.00, the manual's "二位小數"), so they are rescaled here;
+    the raw string keeps the original. 格式1 row: "TF,<acct>,TM09,5,0,0,0,<login>".
+    """
+    f = raw.split(',')
+    if with_avg_price:
+        sell_qty, sell_day, sell_avg, login = 6, 7, 8, 9
+        buy_avg = scale_implied_decimals(safe_get(f, 5), 2)
+        sell_avg_value = scale_implied_decimals(safe_get(f, sell_avg), 2)
+    else:
+        sell_qty, sell_day, login = 5, 6, 7
+        buy_avg = ""
+        sell_avg_value = ""
+    return FuturePositionSides(
+        market_type=safe_get(f, 0),
+        account_no=safe_get(f, 1),
+        symbol=safe_get(f, 2),
+        buy_qty=safe_get(f, 3),
+        buy_day_trade_qty=safe_get(f, 4),
+        buy_avg_price=buy_avg,
+        sell_qty=safe_get(f, sell_qty),
+        sell_day_trade_qty=safe_get(f, sell_day),
+        sell_avg_price=sell_avg_value,
+        login_id=safe_get(f, login),
+        raw=raw,
+    )
+
+
 def parse_future_rights_raw(raw: str) -> FutureRights:
     """Parse one OnFutureRights row: all 41 official fields (4-2-i) in table order, see FUTURE_RIGHTS_FIELDS."""
     f = raw.split(',')
@@ -203,7 +275,7 @@ def parse_query_fill_row(login_id: str, raw: str) -> QueryFillReport:
     Parse one GetFulfillReport row (official 5-4-5, nFormat 1/5). The live rows
     carry NO 商品名稱 column, so from 商品代號 on the 0-based index is 官方編號-2:
     0 市場別, 1 商品別, 2 交易所別, 3 分公司, 4 IBNO, 5 帳號, 6 子帳,
-    7 委託書號, 8 成交序號, 9 成交日, 10 成交時間, 11 歸屬日, 12 商品代號,
+    7 委託書號, 8 成交序號, 9 成交日, 10 成交時間, 11 交易歸屬日, 12 商品代號,
     13-20 兩腳Tandem+成交價1/2, 21 買賣別, 22 盤別, 23 證券委託條件, 24 委託條件,
     25 成交價, 26 成交量, 27 當沖, 28 判別T+1, 29 下單來源, 30 委託方式,
     31 委託有效日, 32 營業員, 33 預估手續費, 34 預估交易稅, 35 幣別,
@@ -216,10 +288,11 @@ def parse_query_fill_row(login_id: str, raw: str) -> QueryFillReport:
         market=safe_get(f, 0), product=safe_get(f, 1), exchange=safe_get(f, 2),
         branch=safe_get(f, 3), account=safe_get(f, 5),
         order_no=safe_get(f, 7), fill_seq=safe_get(f, 8),
-        fill_date=safe_get(f, 9), fill_time=safe_get(f, 10),
+        fill_date=safe_get(f, 9), fill_time=safe_get(f, 10), trade_date=safe_get(f, 11),
         symbol=safe_get(f, 12), buy_sell=safe_get(f, 21), session=safe_get(f, 22),
         stock_flag=safe_get(f, 23), trade_type=safe_get(f, 24),
         price=safe_get(f, 25), qty=safe_get(f, 26),
+        day_trade=safe_get(f, 27), t1_session=safe_get(f, 28),
         agent=safe_get(f, 29), price_type=safe_get(f, 30), sale_no=safe_get(f, 32),
         fee=safe_get(f, 33), tax=safe_get(f, 34),
         order_date=safe_get(f, 36), order_time=safe_get(f, 37),
