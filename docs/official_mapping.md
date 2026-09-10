@@ -35,6 +35,7 @@ SDK 依官方 `CapitalAPI_2.13.58` 手冊（`策略王COM元件使用說明_V2.1
 | historical K-line | `SKQuoteLib_RequestKLineAMByDate`, `OnNotifyKLineData` | `client.request_kline()` / `fetch_quote_history()` |
 | stock positions | `GetRealBalanceReport`, `OnRealBalanceReport` | `client.get_stock_positions()` |
 | future positions | `GetOpenInterestGW(nFormat=1)`, `OnOpenInterest` | `client.get_future_positions()` |
+| future positions（買賣分列 / 含複式單 / 一點價值） | `GetOpenInterestWithFormat(nFormat=1~3)`, `OnOpenInterest` | `client.get_future_positions_with_format()` / `fetch_future_positions_full()` |
 | future rights | `GetFutureRights`, `OnFutureRights` | `client.get_future_rights()` |
 | capital pay | `GetBalance` | `client.get_capital_pay_balance()` |
 | stock order | `SendStockOrder` | `client.place_stock_order()`, `place_stock_limit()`, `place_stock_market()` |
@@ -181,9 +182,19 @@ SDK 依官方 `CapitalAPI_2.13.58` 手冊（`策略王COM元件使用說明_V2.1
   `h` 漲停下一檔 / `l` 跌停上一檔 / `C` 漲 1/2 / `c` 跌 1/2。
 
 **5-4-5 成交查詢列（0-based，實測無「商品名稱」欄）**：0-7 同上、8 成交序號、9/10 成交日期/時間、
-12 商品代號、21 買賣別、22 盤別、23 證券委託條件、25 成交價、26 成交量、30 委託方式、
+**11 交易歸屬日**、12 商品代號、21 買賣別、22 盤別、23 證券委託條件、25 成交價、26 成交量、
+**27 當沖註記(Y 當沖/N 新倉/O 平倉/A 自動)**、**28 判別T+1盤(A T盤/B T+1盤)**、30 委託方式、
 **33 預估手續費（證券 1.425‰，實測吻合）**、**34 預估交易稅（1‰ 或 3‰）**、36/37 委託日期/時間、
 40 交易單位股數、43 成交價金、49 成交時間(hhmmssfff)。
+
+- 手續費/交易稅官方註明**僅證券與複委託**有值，期貨成交列回 `0.00` / `0`（2026-09-09 實測 5 口微台 3 筆分批成交，
+  12 商品代號 `TMFI6`、25 成交價、26 成交量、27 當沖註記 `N`、28 判別T+1盤 `A`、43 成交價金、49 `hhmmssfff` 全部對上）。
+- 夜盤成交：`成交日期` 是實際成交日，`交易歸屬日` 才是它結算到的交易日（`判別T+1盤` = `B`）。
+- **沒有指定日期的委託/成交查詢**：`GetOrderReport` / `GetFulfillReport` 宣告只有
+  (登入ID, 完整帳號, nFormat)，一律當日；手冊中唯一帶起訖日的帳務查詢是
+  `GetProfitLossGWReport`（4-2-73 + `TSPROFITLOSSGWQUERY`），但那是**證券**新損益
+  （欄位為股票代號、現股/融資/融券/現沖），期貨不適用。期貨的已實現損益只有
+  `OnFutureRights` 第 11 欄「本日期貨平倉損益」一個總數。要有歷史請自行每日落地存檔。
 
 ### OnRealBalanceReport 現貨庫存（4-2-c，19 欄，0-based）
 
@@ -202,7 +213,21 @@ GW 格式 1 **不含市價與浮動損益**；查無資料回 `001,查無資料,
 實測列（2026-09-03，1 口微台多單）：`TF,<帳號>,TM09,B,1,0,46560.00,,,<LOGIN>` → 買賣別是 **B/S**，
 手續費 / 交易稅兩欄**空白**，而且商品代號是**庫存表專用的第三套代碼**（微台 `TM09` = TM + MM；
 報價端是 `TM2609`、回報 / 刪單是 `TMFI6`）。三套代碼的對應與轉換在 `capital_api_sdk/taifex.py`
-（`contract_of` / `to_report_code` / `point_value`），欄位中文名在 `models.FUTURE_POSITION_FIELDS`。
+（`contract_of` / `to_report_code` / `to_quote_code` / `point_value`），欄位中文名在 `models.FUTURE_POSITION_FIELDS`。
+
+**GetOpenInterestWithFormat（4-2-59）** 同樣由 `OnOpenInterest` 回傳、同樣以 `##` 結束，nFormat 三種排列（手冊 4-2-d / 4-2-x，
+**2026-09-09 以 5 口微台多單實測**，SDK 保留 `raw`）：
+- `1` 完整（10 欄，**含複式單**）：0 市場別、1 帳號、2 商品、3 買方未平倉、4 買方當沖未平倉、5 買方成交均價、
+  6 賣方未平倉、7 賣方當沖未平倉、8 賣方成交均價、9 LOGIN_ID → `FuturePositionSides`（`FUTURE_POSITION_SIDES_FIELDS`）。
+  實測列 `TF,<帳號>,TM09,5,0,4719400,0,0,0,<LOGIN>`：手冊的「二位小數」是**隱含兩位、沒有小數點**（4719400 = 47194.00），
+  SDK parser 已還原成 `47194.00`；沒有部位的那一邊口數與均價都是 `0`。
+- `2` 格式1（8 欄，含複式單）：同上但沒有兩個均價欄 → `FuturePositionSides`，均價留空。實測 `TF,<帳號>,TM09,5,0,0,0,<LOGIN>`。
+- `3` 格式2（11 欄，不含複式單）：GW 格式 1 的排列在 6 平均成本後**插入 7 一點價值**，8 單口手續費 / 9 交易稅
+  自 2.13.53 起暫不提供，10 LOGIN_ID → `FuturePosition.point_value`。實測 `TF,<帳號>,TM2609,B,5,0,47194.0000,10,,,<LOGIN>`：
+  **商品代號是報價端代碼 `TM2609`**（GW / 完整 / 格式1 都印庫存表代碼 `TM09`），均價四位小數。
+與 `GetOpenInterestGW` 是同一個未平倉查詢，SDK 讓兩者共用 5 秒間隔（`_account_query(interval_key="OpenInterest")`）。
+兩種查詢都**沒有市價與浮動損益**；逐商品試算損益要自己拿報價算（`trade_futures.position_pnl`），
+帳戶層級含費稅的浮動損益在 `OnFutureRights` 第 1 欄。
 `taifex.py` **目前只收錄 TX / MTX / TM**，其他商品一律視為未知（不猜乘數）；各商品代碼格式不一致
 （TX + MM、TM + YYMM、庫存表 TM09），新增商品時三套代碼都要實機確認，步驟寫在 `taifex.py` 檔頭。
 
