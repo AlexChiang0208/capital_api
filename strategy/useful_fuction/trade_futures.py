@@ -1,8 +1,9 @@
 """台指期 (大台 TX / 小台 MTX / 微台 TM) 操作面板邏輯: 查詢包裝、防呆下單、刪單後驗證、emoji 輸出。
 
 給 strategy/台指建倉.py 用: 主程式只留參數與呼叫, 客製邏輯放這裡; 底層規格全部在 capital_api_sdk:
-  商品代碼三套 namespace 與轉碼      capital_api_sdk.taifex (contract_of / to_report_code / point_value ...)
-  回報 / 庫存 / 權益數欄位與中文名    capital_api_sdk.models (QUERY_ORDER_FIELDS / FUTURE_POSITION_FIELDS / FUTURE_RIGHTS_FIELDS)
+  商品代碼三套 namespace 與轉碼      capital_api_sdk.taifex (contract_of / to_report_code / to_quote_code / point_value ...)
+  回報 / 庫存 / 權益數欄位與中文名    capital_api_sdk.models (QUERY_ORDER_FIELDS / QUERY_FILL_FIELDS / FUTURE_POSITION_FIELDS /
+                                      FUTURE_POSITION_SIDES_FIELDS / FUTURE_RIGHTS_FIELDS)
   一次性報價 (訂閱 -> 新快照 -> 退訂)  capital_api_sdk.fetch_latest_quotes
   帳務查詢 5 秒間隔 / 沒回應就丟例外   CapitalClient.get_future_positions / get_future_rights
   3030 報價重連                        CapitalClient.reconnect_quote
@@ -12,11 +13,19 @@ TaifexTrader 功能一覽:
   rights()         資金: 權益數 / 可用餘額 / 保證金 / 浮動損益 (41 欄)
   positions()      庫存: 期貨未平倉
   open_orders()    掛單: 當前可刪掛單 (symbol 欄 = 交易所契約代碼, 刪單就用它)
-                   三個查詢回傳的表欄名都是「中文 english」, 直接 .T 看; 程式要用英文欄名請走 query_*()
+  fills()          成交: 當日成交明細 (一列一筆成交) + 每商品買賣口數與均價
+  orders()         委託: 今日全部委託歷程 (含已成 / 已刪 / 失敗 / 委託中) + 狀態統計
+  positions_full() 庫存 (買賣分列): 每商品一列, 買方 / 賣方口數與均價並排, 含複式單 (GetOpenInterestWithFormat)
+                   以上查詢回傳的表欄名都是「中文 english」, 直接 .T 看; 程式要用英文欄名請走 query_*()
+  pnl()            試算損益: 庫存逐商品 (市價 - 均價) x 乘數 x 口數, 不含費稅 (英文欄名表)
+  overview()       當日總覽: 資金 -> 庫存 -> 今日委託 -> 掛單 -> 今日成交 一次跑完, 回傳各表的 dict
   quote(symbol)    報價: 商品是否存在 + 最後價 + b1/a1 + 漲跌停; 訂閱被拒 (3030) 自動重連一次
   place_limit()    下限價單: check_order() 全部通過才送
   cancel(symbol)   刪掉某商品在該帳號的所有掛單: 先查有沒有, 再刪, 再驗證
   cancel_all()     刪掉該帳號全部委託, 要 confirm=True 才動作
+  面板 (strategy/台指建倉.py) 放 rights / positions_full / open_orders / orders / fills / quote / place_limit / cancel:
+  positions() 是 positions_full() 的子集 (GW 格式), 留給 place_limit 防呆內部用;
+  pnl() / overview() 是自己算的與組合功能, 面板不放, 券商算好的浮動損益直接看 rights()。
 
 商品代碼速查 (2026-09 實查, 每次換月會變, 用 quote() 確認):
   報價 / 下單: 大台 TX09 / TX00, 小台 MTX09 / MTX00, 微台 TM2609 / TM0000 (價差 TX09/10 與 TX00AM 不給下)
@@ -45,8 +54,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from capital_api_sdk import (  # noqa: E402
     FUTURE_POSITION_FIELDS,
+    FUTURE_POSITION_SIDES_FIELDS,
     FUTURE_RIGHTS_FIELDS,
     FUTURE_RIGHTS_TEXT_FIELDS,
+    OPEN_ORDER_STATUSES,
+    QUERY_FILL_FIELDS,
     QUERY_ORDER_FIELDS,
     ApiResult,
     CapitalClient,
@@ -54,22 +66,28 @@ from capital_api_sdk import (  # noqa: E402
     FuturesReserved,
     Side,
     TradeType,
+    fetch_fulfill_reports,
     fetch_future_positions,
+    fetch_future_positions_full,
     fetch_future_rights,
     fetch_latest_quotes,
     fetch_order_reports,
     normalize_side,
 )
-from capital_api_sdk.taifex import CONTRACTS, contract_of, is_orderable, point_value, to_report_code  # noqa: E402
+from capital_api_sdk.taifex import (  # noqa: E402
+    CONTRACTS, contract_of, is_orderable, point_value, to_quote_code, to_report_code,
+)
 
 __all__ = [
     "RiskLimits", "Quote", "Exposure", "GuardResult", "OrderOutcome", "TaifexTrader",
-    "RIGHTS_LABELS", "POSITION_LABELS", "ORDER_LABELS",
-    "to_decimal", "format_price", "notional", "net_exposure", "check_order", "print_guard",
-    "query_rights", "query_positions", "query_open_orders", "query_quote", "futures_account",
+    "RIGHTS_LABELS", "POSITION_LABELS", "POSITION_SIDES_LABELS", "ORDER_LABELS", "FILL_LABELS",
+    "to_decimal", "format_price", "notional", "net_exposure", "sides_exposure", "check_order", "print_guard",
+    "query_rights", "query_positions", "query_positions_full", "query_orders", "query_open_orders",
+    "query_fills", "query_quote",
+    "summarize_fills", "summarize_orders", "position_pnl", "futures_account",
     "report_result", "say",
     # 底層規格, 從 SDK 轉出來給面板 / 測試直接用
-    "CONTRACTS", "contract_of", "is_orderable", "point_value", "to_report_code", "normalize_side",
+    "CONTRACTS", "contract_of", "is_orderable", "point_value", "to_quote_code", "to_report_code", "normalize_side",
     "Side", "TradeType", "FuturesNewClose", "FuturesReserved",
 ]
 
@@ -101,7 +119,9 @@ def _labels(fields: dict[str, str]) -> dict[str, str]:
 
 RIGHTS_LABELS = _labels(FUTURE_RIGHTS_FIELDS)
 POSITION_LABELS = _labels(FUTURE_POSITION_FIELDS)
+POSITION_SIDES_LABELS = _labels(FUTURE_POSITION_SIDES_FIELDS)
 ORDER_LABELS = _labels(QUERY_ORDER_FIELDS)
+FILL_LABELS = _labels(QUERY_FILL_FIELDS)
 
 
 # ======================================================================
@@ -149,6 +169,16 @@ def notional(symbol: str, price: Any, qty: Any, side: Any) -> Decimal:
 class Exposure:
     total: Decimal = Decimal(0)                       # 帶號淨名目 (買 +, 賣 -)
     unknown: list[str] = field(default_factory=list)  # 算不出名目的列, 例如 "TXO47000I6: 未知契約乘數"
+
+
+def sides_exposure(frame: pd.DataFrame) -> Exposure:
+    """買賣分列的庫存表 (query_positions_full) -> 帶號淨名目: 買方列 +, 賣方列 -, 口數 0 的那一邊略過。"""
+    rows: list[dict] = []
+    for row in frame.to_dict("records"):
+        symbol = row.get("symbol", "")
+        rows.append({"symbol": symbol, "price": row.get("buy_avg_price"), "qty": row.get("buy_qty"), "buy_sell": "B"})
+        rows.append({"symbol": symbol, "price": row.get("sell_avg_price"), "qty": row.get("sell_qty"), "buy_sell": "S"})
+    return net_exposure(rows, "price", "qty")
 
 
 def net_exposure(rows: Iterable[dict], price_key: str, qty_key: str, side_key: str = "buy_sell") -> Exposure:
@@ -412,18 +442,136 @@ def query_positions(client: CapitalClient, account: str) -> pd.DataFrame:
     symbol 是庫存表代碼 (微台 TM09), contract_of() 認得。官方格式 1 不含市價與浮動損益;
     帳戶層級看 query_rights 的 floating_pnl, 逐商品要自己拿 quote().last 減 avg_price 再乘 point_value()。
     空表就是真的沒部位: 查詢沒回應時 SDK 會丟 CapitalApiError。
+    point_value 欄只有 WithFormat 格式2 才有值, GW 列整欄空白就拿掉, 表面乾淨一點。
     """
-    return _frame(fetch_future_positions(client, account=account))
+    frame = _frame(fetch_future_positions(client, account=account))
+    if "point_value" in frame and frame["point_value"].astype(str).str.strip().eq("").all():
+        frame = frame.drop(columns="point_value")
+    return frame
+
+
+def query_positions_full(client: CapitalClient, account: str) -> pd.DataFrame:
+    """庫存 (買賣分列): GetOpenInterestWithFormat nFormat=1 完整, 欄名見 FUTURE_POSITION_SIDES_FIELDS。
+
+    每個商品一列, 買方 / 賣方的口數、當沖口數、成交均價並排, 含複式單 (query_positions 的 GW 格式不含)。
+    與 query_positions 共用官方 5 秒查詢間隔; 查詢沒回應 SDK 丟 CapitalApiError, 空表就是真的沒部位。
+    2026-09-09 實機驗證: 元件回的均價沒有小數點 (4719400), SDK 已還原成 47194.00; 沒有部位的那一邊是 0。
+    """
+    return _frame(fetch_future_positions_full(client, account=account))
+
+
+def query_orders(client: CapitalClient, account: str, *, n_format: int = 1) -> pd.DataFrame:
+    """委託: 今日委託 (GetOrderReport, 同步查詢, 欄名見 QUERY_ORDER_FIELDS)。一列一張委託書。
+
+    n_format: 1 全部 / 2 有效 / 3 可消 / 4 已消 / 5 已成 / 6 失敗 / 9 預約
+              (7 合併同價格 / 8 合併同商品 是另一種欄位排列, 具名欄位對不上, 只能讀 raw)。
+    status_name 是委託狀態中文 (全部成交 / 全部取消 / 委託成功 / 部分成交...),
+    filled_qty / avg_fill_price / cancel_qty 是這張單的成交量、成交均價、取消總量。
+    不用 OnNewData cache: cache 只有本 process 連線期間收到的回報, 重開 kernel 就空了。
+    symbol 欄是交易所契約代碼 (MXFI6 / TMFI6), 刪單要用它。
+    官方限制兩次委託 / 成交查詢間隔 5 秒, SDK 會自動等, 所以連續呼叫會慢幾秒。
+    """
+    return _frame(fetch_order_reports(client, account=account, n_format=n_format))
 
 
 def query_open_orders(client: CapitalClient, account: str) -> pd.DataFrame:
-    """掛單: 當前可刪掛單 (GetOrderReport n_format=3, 同步查詢, 欄名見 QUERY_ORDER_FIELDS)。
+    """掛單: 當前可刪掛單 (GetOrderReport n_format=3), 其餘同 query_orders。"""
+    return query_orders(client, account, n_format=3)
 
-    不用 OnNewData cache: cache 只有本 process 連線期間收到的回報, 重開 kernel 就空了。
-    symbol 欄是交易所契約代碼 (MXFI6 / TMFI6), 刪單要用它。
-    官方限制兩次委託查詢間隔 5 秒, SDK 會自動等, 所以連續呼叫會慢幾秒。
+
+def summarize_orders(frame: pd.DataFrame) -> str:
+    """今日委託表 -> 一行「5 筆: 全部成交 2 / 全部取消 2 / 委託成功 1」(依 status_name 計數, 多的排前面)。"""
+    if frame.empty or "status_name" not in frame:
+        return ""
+    counts = frame["status_name"].astype(str).str.strip().replace("", "未知").value_counts()
+    return f"{len(frame)} 筆: " + " / ".join(f"{name} {count}" for name, count in counts.items())
+
+
+def query_fills(client: CapitalClient, account: str, *, n_format: int = 1) -> pd.DataFrame:
+    """成交: 當日成交明細 (GetFulfillReport, 同步查詢, 欄名見 QUERY_FILL_FIELDS)。
+
+    一列 = 一筆成交 (同一張委託分次成交會有多列), key 是成交序號。
+    symbol 欄是交易所契約代碼 (MXFI6 / TMFI6); 期貨的手續費 / 交易稅欄位回 0
+    (官方註明僅證券與複委託有值), 要算成本請自己用商品費率乘口數。
+    夜盤成交的 fill_date 是實際成交日, trade_date (交易歸屬日) 才是結算到的交易日,
+    t1_session=B 就是 T+1 盤 (夜盤)。
+    n_format: 1 完整 / 5 T+1成交; 2 合併同書號 / 3 合併同價格 / 4 合併同商品 是另一種
+    欄位排列, 具名欄位會對不上, 只能讀 raw。
+    官方限制兩次委託 / 成交查詢間隔 5 秒, SDK 會自動等, 所以剛查過掛單再查成交會慢幾秒。
+    查不到資料回空表 (M003); 查詢被拒 (M999) SDK 重試 3 次後丟 CapitalApiError。
     """
-    return _frame(fetch_order_reports(client, account=account, n_format=3))
+    return _frame(fetch_fulfill_reports(client, account=account, n_format=n_format))
+
+
+PNL_COLUMNS = ("symbol", "quote_symbol", "buy_sell", "open_qty", "avg_price", "last", "pnl_points", "point_value", "pnl")
+
+
+def position_pnl(positions: pd.DataFrame, quotes: dict[str, Quote]) -> pd.DataFrame:
+    """庫存表 x 報價 -> 逐商品試算損益 (純計算, 不碰 API)。
+
+    每列: symbol (庫存表代碼) / quote_symbol (報價端代碼, to_quote_code) / buy_sell / open_qty / avg_price /
+    last / pnl_points (買: last - avg, 賣: avg - last) / point_value / pnl (= pnl_points x point_value x open_qty)。
+    不含手續費與期交稅 (策略王「試算損益」有扣來回費稅, 會比這裡少幾十元)。
+    認不得的商品、沒報價、價量解不出來的列 last / pnl 留 None, 由呼叫端提醒, 不會偷偷當 0。
+    quotes 的 key 是報價端代碼。
+    """
+    rows: list[dict] = []
+    for row in positions.to_dict("records"):
+        symbol = str(row.get("symbol", "")).strip()
+        code = to_quote_code(symbol)
+        quote = quotes.get(code) if code else None
+        last = quote.last if quote else None
+        avg = to_decimal(row.get("avg_price"))
+        qty = to_decimal(row.get("open_qty"))
+        multiplier = point_value(symbol)
+        try:
+            side = normalize_side(row.get("buy_sell"))
+        except ValueError:
+            side = ""
+        points = pnl = None
+        if None not in (last, avg, qty, multiplier) and side:
+            points = (last - avg) if side == "B" else (avg - last)
+            pnl = points * multiplier * qty
+        rows.append({"symbol": symbol, "quote_symbol": code, "buy_sell": side, "open_qty": qty, "avg_price": avg,
+                     "last": last, "pnl_points": points, "point_value": multiplier, "pnl": pnl})
+    return pd.DataFrame(rows, columns=list(PNL_COLUMNS))
+
+
+def summarize_fills(frame: pd.DataFrame) -> list[str]:
+    """成交明細 -> 每個商品一行: 買 n 口 @ 量加權均價 / 賣 n 口 @ 均價 / 淨 n 口。
+
+    價、量、買賣別解不出來的列 (合併格式或欄位異動) 不會偷偷當 0, 會跳過並在行尾標 ⚠️。
+    """
+    needed = {"symbol", "buy_sell", "price", "qty"}
+    if frame.empty or not needed <= set(frame.columns):
+        return []
+    work = pd.DataFrame({
+        "symbol": frame["symbol"].astype(str).str.strip(),
+        "side": frame["buy_sell"].astype(str).str.strip().str.upper(),
+        "price": pd.to_numeric(frame["price"], errors="coerce"),
+        "qty": pd.to_numeric(frame["qty"], errors="coerce"),
+    })
+    work["usable"] = work["price"].notna() & work["qty"].notna() & work["side"].isin(("B", "S"))
+
+    lines: list[str] = []
+    for symbol, group in work.groupby("symbol", sort=True):
+        parts: list[str] = []
+        net = 0.0
+        for code, label in (("B", "買"), ("S", "賣")):
+            rows = group[group["usable"] & (group["side"] == code)]
+            lots = rows["qty"].sum()
+            if lots <= 0:
+                continue
+            avg = (rows["price"] * rows["qty"]).sum() / lots
+            parts.append(f"{label} {lots:,.0f} 口 @ {avg:,.2f}")
+            net += lots if code == "B" else -lots
+        if parts:
+            parts.append(f"淨 {net:+,.0f} 口")
+        skipped = int((~group["usable"]).sum())
+        if skipped:
+            parts.append(f"⚠️ {skipped} 列價量看不懂, 沒算進來")
+        lines.append(f"{symbol}  " + "  ".join(parts))
+    return lines
 
 
 def query_quote(client: CapitalClient, symbol: str, *, seconds: float = 3.0, with_ticks: bool = False,
@@ -593,14 +741,33 @@ class TaifexTrader:
     def positions(self) -> pd.DataFrame:
         """庫存: 期貨未平倉, 印淨名目 (平均成本計), 回傳表欄名「中文 english」。"""
         frame = query_positions(self.client, self.account)
+        self._report_positions(frame)
+        return frame.rename(columns=POSITION_LABELS)
+
+    @staticmethod
+    def _report_positions(frame: pd.DataFrame) -> None:
+        if frame.empty:
+            say("ℹ️ 沒有未平倉部位")
+            return
+        exposure = net_exposure(frame.to_dict("records"), "avg_price", "open_qty")
+        say(f"✅ 未平倉 {len(frame)} 筆, 淨名目 (平均成本計) {exposure.total:+,.0f}")
+        for item in exposure.unknown:
+            say(f"⚠️ 算不出名目: {item}")
+
+    def positions_full(self) -> pd.DataFrame:
+        """庫存 (買賣分列): 每個商品一列, 買方 / 賣方口數與均價並排, 含複式單, 回傳表欄名「中文 english」。
+
+        走 GetOpenInterestWithFormat 完整格式, 與 positions() 共用官方 5 秒查詢間隔, 連著跑會等幾秒。
+        """
+        frame = query_positions_full(self.client, self.account)
         if frame.empty:
             say("ℹ️ 沒有未平倉部位")
         else:
-            exposure = net_exposure(frame.to_dict("records"), "avg_price", "open_qty")
-            say(f"✅ 未平倉 {len(frame)} 筆, 淨名目 (平均成本計) {exposure.total:+,.0f}")
+            exposure = sides_exposure(frame)
+            say(f"✅ 未平倉 {len(frame)} 個商品 (買賣分列, 含複式單), 淨名目 (平均成本計) {exposure.total:+,.0f}")
             for item in exposure.unknown:
                 say(f"⚠️ 算不出名目: {item}")
-        return frame.rename(columns=POSITION_LABELS)
+        return frame.rename(columns=POSITION_SIDES_LABELS)
 
     def open_orders(self) -> pd.DataFrame:
         """掛單: 當前可刪掛單 (symbol 欄就是刪單要用的代碼), 回傳表欄名「中文 english」。"""
@@ -610,6 +777,88 @@ class TaifexTrader:
         else:
             say(f"✅ 可刪掛單 {len(frame)} 筆, 代碼: {sorted(set(frame['symbol']))}")
         return frame.rename(columns=ORDER_LABELS)
+
+    def orders(self, *, n_format: int = 1) -> pd.DataFrame:
+        """委託: 今日全部委託 (含已成 / 已刪 / 失敗 / 委託中), 印狀態統計, 回傳表欄名「中文 english」。
+
+        n_format 預設 1 全部; 3 可刪掛單 (同 open_orders) / 4 已消 / 5 已成 / 6 失敗 / 9 預約。
+        """
+        frame = query_orders(self.client, self.account, n_format=n_format)
+        if frame.empty:
+            say("ℹ️ 今日沒有委託")
+        else:
+            say(f"✅ 今日委託 {summarize_orders(frame)}")
+        return frame.rename(columns=ORDER_LABELS)
+
+    def pnl(self, positions: pd.DataFrame | None = None) -> pd.DataFrame:
+        """試算損益: 庫存逐商品 (市價 - 均價) x 乘數 x 口數, 不含費稅; 印每列與合計, 回傳英文欄名表 (PNL_COLUMNS)。
+
+        positions 可傳 query_positions() 查好的表 (英文欄名), None 就當場查。
+        每個商品各查一次報價 (0.5~3 秒), 3030 會自動重連一次。認不得的商品或抓不到報價的列 pnl 是 None 並提醒。
+        帳戶層級的浮動損益看 rights() 的 floating_pnl (券商計價時點與這裡的報價不同, 差個幾點是正常的)。
+        """
+        if positions is None:
+            positions = query_positions(self.client, self.account)
+        if positions.empty:
+            say("ℹ️ 沒有未平倉部位, 沒有損益可算")
+            return position_pnl(positions, {})
+        quotes: dict[str, Quote] = {}
+        for symbol in sorted(set(positions["symbol"].astype(str).str.strip())):
+            code = to_quote_code(symbol)
+            if code is None:
+                say(f"⚠️ {symbol} 認不得, 轉不成報價端代碼 (taifex.py 只收錄 TX / MTX / TM)")
+                continue
+            quotes[code] = query_quote(self.client, code)
+        frame = position_pnl(positions, quotes)
+        for row in frame.itertuples(index=False):
+            if row.pnl is None:
+                say(f"⚠️ {row.symbol} 算不出損益 (報價端 {row.quote_symbol}: last={row.last})")
+            else:
+                side_text = {"B": "買", "S": "賣"}.get(row.buy_sell, row.buy_sell)
+                say(f"   {row.symbol} {side_text} {row.open_qty} 口 @ {row.avg_price}  市價 {row.last}"
+                    f"  {row.pnl_points:+} 點 x {row.point_value} = {row.pnl:+,.0f}")
+        known = [value for value in frame["pnl"] if value is not None]
+        say(f"✅ 試算損益合計 {sum(known):+,.0f} (不含手續費與期交稅, {len(known)}/{len(frame)} 列有算到)")
+        return frame
+
+    def overview(self, *, with_pnl: bool = False) -> dict[str, pd.DataFrame]:
+        """當日總覽 (唯讀): 資金 -> 庫存 -> 今日委託 -> 掛單 -> 今日成交 (-> 試算損益), 每段印摘要。
+
+        回傳 {"rights", "positions", "orders", "open_orders", "fills"[, "pnl"]}, 表欄名「中文 english」(pnl 表英文欄名)。
+        掛單直接從今日委託表篩狀態 0 預約 / 5 部分成交可消 / 7 委託成功 (OPEN_ORDER_STATUSES),
+        省掉一次要等 5 秒間隔的查詢; 委託與成交查詢共用官方 5 秒間隔, 整趟約 8~12 秒,
+        with_pnl=True 再加每個商品一次報價。
+        """
+        say("── 當日總覽 ──")
+        views: dict[str, pd.DataFrame] = {"rights": self.rights()}
+        positions = query_positions(self.client, self.account)
+        self._report_positions(positions)
+        views["positions"] = positions.rename(columns=POSITION_LABELS)
+        orders = self.orders(n_format=1)
+        views["orders"] = orders
+        status_column = ORDER_LABELS["status"]
+        open_orders = (orders[orders[status_column].astype(str).str.strip().isin(OPEN_ORDER_STATUSES)]
+                       if status_column in orders else orders)
+        views["open_orders"] = open_orders
+        say(f"{'✅' if not open_orders.empty else 'ℹ️'} 掛單中 {len(open_orders)} 筆 (從今日委託表篩狀態 0/5/7)")
+        views["fills"] = self.fills()
+        if with_pnl:
+            views["pnl"] = self.pnl(positions)
+        return views
+
+    def fills(self, *, n_format: int = 1) -> pd.DataFrame:
+        """成交: 當日成交明細, 印每個商品的買賣口數與量加權均價, 回傳表欄名「中文 english」。
+
+        n_format=5 查 T+1 盤 (夜盤) 成交; 合併格式 2/3/4 欄位對不上, 只能讀 raw 欄。
+        """
+        frame = query_fills(self.client, self.account, n_format=n_format)
+        if frame.empty:
+            say("ℹ️ 今日沒有成交明細")
+            return frame
+        say(f"✅ 今日成交 {len(frame)} 筆")
+        for line in summarize_fills(frame):
+            say(f"   {line}")
+        return frame.rename(columns=FILL_LABELS)
 
     def quote(self, symbol: str, *, with_ticks: bool = False) -> Quote:
         """報價: 印出商品是否存在 / 最後價 / b1 a1 / 漲跌停, 回傳 Quote。3030 會自動重連一次。"""
