@@ -94,6 +94,11 @@ fills = fetch_fulfill_reports(client)         # GetFulfillReport，預設 n_form
 rows = client.get_order_report(n_format=1)    # 物件形式：QueryOrderReport（row.status_name / is_open）
 ```
 
+**只有當日**：兩個查詢都沒有日期參數，SKCOM 也沒有期貨的歷史委託/成交查詢
+（唯一帶起訖日的 `GetProfitLossGWReport` 是證券新損益），要有歷史請自行每日落地存檔。
+成交列的手續費/交易稅**僅證券與複委託**有值（期貨列回 `0.00` / `0`）；夜盤成交看 `trade_date`（交易歸屬日）與
+`t1_session`（`B` = T+1 盤），`fill_date` 是實際成交日。
+
 ## 報價查詢
 
 > **先確認帳號的行情權限**：收不收得到行情取決於登入帳號，而且權限不足是**靜默失敗**——
